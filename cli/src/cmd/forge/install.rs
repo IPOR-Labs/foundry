@@ -5,7 +5,6 @@ use crate::{
     prompt,
     utils::{p_println, CommandUtils},
 };
-use atty::{self, Stream};
 use clap::{Parser, ValueHint};
 use ethers::solc::Project;
 use foundry_common::fs;
@@ -44,19 +43,16 @@ pub struct InstallArgs {
     ///
     /// Target installation directory can be added via `<alias>=` suffix.
     /// The dependency will installed to `lib/<alias>`.
-    #[clap(value_name = "DEPENDENCIES")]
     dependencies: Vec<Dependency>,
 
     #[clap(flatten)]
     opts: DependencyInstallOpts,
 
-    #[clap(
-        help = "The project's root path.",
-        long_help = "The project's root path. By default, this is the root directory of the current Git repository, or the current working directory.",
-        long,
-        value_hint = ValueHint::DirPath,
-        value_name = "PATH"
-    )]
+    /// The project's root path.
+    ///
+    /// By default root of the Git repository, if in one,
+    /// or the current working directory.
+    #[clap(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
     pub root: Option<PathBuf>,
 }
 
@@ -74,13 +70,16 @@ impl Cmd for InstallArgs {
 
 #[derive(Debug, Clone, Copy, Default, Parser)]
 pub struct DependencyInstallOpts {
-    #[clap(help = "Install without adding the dependency as a submodule.", long)]
+    /// Install without adding the dependency as a submodule.
+    #[clap(long)]
     pub no_git: bool,
 
-    #[clap(help = "Do not create a commit.", long)]
+    /// Do not create a commit.
+    #[clap(long)]
     pub no_commit: bool,
 
-    #[clap(help = "Do not print any messages.", short, long)]
+    /// Do not print any messages.
+    #[clap(short, long)]
     pub quiet: bool,
 }
 
@@ -458,7 +457,7 @@ fn git_checkout(
     let mut tag = dep.tag.clone().unwrap();
     let mut is_branch = false;
     // only try to match tag if current terminal is a tty
-    if atty::is(Stream::Stdout) {
+    if is_terminal::is_terminal(&std::io::stdout()) {
         if tag.is_empty() {
             tag = match_tag(&tag, libs, target_dir)?;
         } else if let Some(branch) = match_branch(&tag, libs, target_dir)? {

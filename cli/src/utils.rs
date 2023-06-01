@@ -3,12 +3,10 @@ use ethers::{
     abi::token::{LenientTokenizer, Tokenizer},
     prelude::TransactionReceipt,
     providers::Middleware,
-    solc::EvmVersion,
     types::U256,
     utils::format_units,
 };
 use eyre::Result;
-use forge::executor::SpecId;
 use foundry_config::{Chain, Config};
 use std::{
     future::Future,
@@ -31,7 +29,7 @@ pub use foundry_config::utils::*;
 pub(crate) const VERSION_MESSAGE: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
-    env!("VERGEN_GIT_SHA_SHORT"),
+    env!("VERGEN_GIT_SHA"),
     " ",
     env!("VERGEN_BUILD_TIMESTAMP"),
     ")"
@@ -83,15 +81,6 @@ pub fn subscriber() {
         .with(ErrorLayer::default())
         .with(tracing_subscriber::fmt::layer())
         .init()
-}
-
-pub fn evm_spec(evm: &EvmVersion) -> SpecId {
-    match evm {
-        EvmVersion::Istanbul => SpecId::ISTANBUL,
-        EvmVersion::Berlin => SpecId::BERLIN,
-        EvmVersion::London => SpecId::LONDON,
-        _ => panic!("Unsupported EVM version"),
-    }
 }
 
 /// parse a hex str or decimal str as U256
