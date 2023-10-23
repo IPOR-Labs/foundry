@@ -2,14 +2,17 @@
 pragma solidity 0.8.18;
 
 import "ds-test/test.sol";
-import "./Cheats.sol";
+import "./Vm.sol";
 
 contract ProjectRootTest is DSTest {
-    Cheats constant cheats = Cheats(HEVM_ADDRESS);
+    Vm constant vm = Vm(HEVM_ADDRESS);
+    bytes public manifestDirBytes;
 
     function testProjectRoot() public {
-        bytes memory manifestDirBytes = bytes(cheats.envString("CARGO_MANIFEST_DIR"));
-
+        manifestDirBytes = bytes(vm.envString("CARGO_MANIFEST_DIR"));
+        for (uint256 i = 0; i < 7; i++) {
+            manifestDirBytes.pop();
+        }
         // replace "forge" suffix with "testdata" suffix to get expected project root from manifest dir
         bytes memory expectedRootSuffix = bytes("testd");
         for (uint256 i = 1; i < 6; i++) {
@@ -17,6 +20,6 @@ contract ProjectRootTest is DSTest {
         }
         bytes memory expectedRootDir = abi.encodePacked(manifestDirBytes, "ata");
 
-        assertEq(cheats.projectRoot(), string(expectedRootDir));
+        assertEq(vm.projectRoot(), string(expectedRootDir));
     }
 }

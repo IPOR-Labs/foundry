@@ -2,7 +2,8 @@
 pragma solidity 0.8.18;
 
 import "ds-test/test.sol";
-import "./Cheats.sol";
+import "../logs/console.sol";
+import "./Vm.sol";
 
 struct MyStruct {
     uint256 value;
@@ -27,15 +28,15 @@ contract MyContract {
 }
 
 contract ForkTest is DSTest {
-    Cheats constant cheats = Cheats(HEVM_ADDRESS);
+    Vm constant vm = Vm(HEVM_ADDRESS);
 
     uint256 mainnetFork;
     uint256 optimismFork;
 
     // this will create two _different_ forks during setup
     function setUp() public {
-        mainnetFork = cheats.createFork("rpcAlias");
-        optimismFork = cheats.createFork("https://opt-mainnet.g.alchemy.com/v2/UVatYU2Ax0rX6bDiqddeTRDdcCxzdpoE");
+        mainnetFork = vm.createFork("rpcAlias");
+        optimismFork = vm.createFork("https://opt-mainnet.g.alchemy.com/v2/UVatYU2Ax0rX6bDiqddeTRDdcCxzdpoE");
     }
 
     // ensures forks use different ids
@@ -45,27 +46,27 @@ contract ForkTest is DSTest {
 
     // ensures forks use different ids
     function testCanSwitchForks() public {
-        cheats.selectFork(mainnetFork);
-        assertEq(mainnetFork, cheats.activeFork());
-        cheats.selectFork(optimismFork);
-        assertEq(optimismFork, cheats.activeFork());
-        cheats.selectFork(optimismFork);
-        assertEq(optimismFork, cheats.activeFork());
-        cheats.selectFork(mainnetFork);
-        assertEq(mainnetFork, cheats.activeFork());
+        vm.selectFork(mainnetFork);
+        assertEq(mainnetFork, vm.activeFork());
+        vm.selectFork(optimismFork);
+        assertEq(optimismFork, vm.activeFork());
+        vm.selectFork(optimismFork);
+        assertEq(optimismFork, vm.activeFork());
+        vm.selectFork(mainnetFork);
+        assertEq(mainnetFork, vm.activeFork());
     }
 
     function testCanCreateSelect() public {
-        uint256 anotherFork = cheats.createSelectFork("rpcAlias");
-        assertEq(anotherFork, cheats.activeFork());
+        uint256 anotherFork = vm.createSelectFork("rpcAlias");
+        assertEq(anotherFork, vm.activeFork());
     }
 
     // ensures forks have different block hashes
     function testBlockNumbersMimatch() public {
-        cheats.selectFork(mainnetFork);
+        vm.selectFork(mainnetFork);
         uint256 num = block.number;
         bytes32 mainHash = blockhash(block.number - 1);
-        cheats.selectFork(optimismFork);
+        vm.selectFork(optimismFork);
         uint256 num2 = block.number;
         bytes32 optimismHash = blockhash(block.number - 1);
         assert(mainHash != optimismHash);
@@ -73,24 +74,24 @@ contract ForkTest is DSTest {
 
     // test that we can switch between forks, and "roll" blocks
     function testCanRollFork() public {
-        cheats.selectFork(mainnetFork);
-        uint256 otherMain = cheats.createFork("rpcAlias", block.number - 1);
-        cheats.selectFork(otherMain);
+        vm.selectFork(mainnetFork);
+        uint256 otherMain = vm.createFork("rpcAlias", block.number - 1);
+        vm.selectFork(otherMain);
         uint256 mainBlock = block.number;
 
         uint256 forkedBlock = 14608400;
-        uint256 otherFork = cheats.createFork("rpcAlias", forkedBlock);
-        cheats.selectFork(otherFork);
+        uint256 otherFork = vm.createFork("rpcAlias", forkedBlock);
+        vm.selectFork(otherFork);
         assertEq(block.number, forkedBlock);
 
-        cheats.rollFork(forkedBlock + 1);
+        vm.rollFork(forkedBlock + 1);
         assertEq(block.number, forkedBlock + 1);
 
         // can also roll by id
-        cheats.rollFork(otherMain, mainBlock + 1);
+        vm.rollFork(otherMain, mainBlock + 1);
         assertEq(block.number, forkedBlock + 1);
 
-        cheats.selectFork(otherMain);
+        vm.selectFork(otherMain);
         assertEq(block.number, mainBlock + 1);
     }
 
@@ -100,7 +101,7 @@ contract ForkTest is DSTest {
         uint256 block = 16261704;
 
         // fork until previous block
-        uint256 fork = cheats.createSelectFork("rpcAlias", block - 1);
+        uint256 fork = vm.createSelectFork("rpcAlias", block - 1);
 
         // block transactions in order: https://beaconcha.in/block/16261704#transactions
         // run transactions from current block until tx
@@ -118,7 +119,7 @@ contract ForkTest is DSTest {
         uint256 newBalance = account.balance - transferAmount;
 
         // execute transactions in block until tx
-        cheats.rollFork(tx);
+        vm.rollFork(tx);
 
         // balance must be less than newBalance due to gas spent
         assert(account.balance < newBalance);
@@ -126,24 +127,24 @@ contract ForkTest is DSTest {
 
     /// checks that marking as persistent works
     function testMarkPersistent() public {
-        assert(cheats.isPersistent(address(this)));
+        assert(vm.isPersistent(address(this)));
 
-        cheats.selectFork(mainnetFork);
+        vm.selectFork(mainnetFork);
 
         DummyContract dummy = new DummyContract();
-        assert(!cheats.isPersistent(address(dummy)));
+        assert(!vm.isPersistent(address(dummy)));
 
         uint256 expectedValue = 99;
         dummy.set(expectedValue);
 
-        cheats.selectFork(optimismFork);
+        vm.selectFork(optimismFork);
 
-        cheats.selectFork(mainnetFork);
+        vm.selectFork(mainnetFork);
         assertEq(dummy.val(), expectedValue);
-        cheats.makePersistent(address(dummy));
-        assert(cheats.isPersistent(address(dummy)));
+        vm.makePersistent(address(dummy));
+        assert(vm.isPersistent(address(dummy)));
 
-        cheats.selectFork(optimismFork);
+        vm.selectFork(optimismFork);
         // the account is now marked as persistent and the contract is persistent across swaps
         dummy.hello();
         assertEq(dummy.val(), expectedValue);
@@ -151,7 +152,7 @@ contract ForkTest is DSTest {
 
     // checks diagnostic
     function testNonExistingContractRevert() public {
-        cheats.selectFork(mainnetFork);
+        vm.selectFork(mainnetFork);
         DummyContract dummy = new DummyContract();
 
         // this will succeed since `dummy` is deployed on the currently active fork
@@ -159,11 +160,72 @@ contract ForkTest is DSTest {
 
         address dummyAddress = address(dummy);
 
-        cheats.selectFork(optimismFork);
+        vm.selectFork(optimismFork);
         assertEq(dummyAddress, address(dummy));
 
         // this will revert since `dummy` does not exists on the currently active fork
         string memory msg2 = dummy.hello();
+    }
+
+    struct EthGetLogsJsonParseable {
+        bytes32 blockHash;
+        bytes blockNumber; // Should be uint256, but is returned from RPC in 0x... format
+        bytes32 data; // Should be bytes, but in our particular example is bytes32
+        address emitter;
+        bytes logIndex; // Should be uint256, but is returned from RPC in 0x... format
+        bool removed;
+        bytes32[] topics;
+        bytes32 transactionHash;
+        bytes transactionIndex; // Should be uint256, but is returned from RPC in 0x... format
+    }
+
+    function testEthGetLogs() public {
+        vm.selectFork(mainnetFork);
+        address weth = address(0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2);
+        bytes32 withdrawalTopic = 0x7fcf532c15f0a6db0bd6d0e038bea71d30d808c7d98cb3bf7268a95bf5081b65;
+        uint256 blockNumber = 17623835;
+
+        string memory path = "fixtures/Rpc/eth_getLogs.json";
+        string memory file = vm.readFile(path);
+        bytes memory parsed = vm.parseJson(file);
+        EthGetLogsJsonParseable[] memory fixtureLogs = abi.decode(parsed, (EthGetLogsJsonParseable[]));
+
+        bytes32[] memory topics = new bytes32[](1);
+        topics[0] = withdrawalTopic;
+        Vm.EthGetLogs[] memory logs = vm.eth_getLogs(blockNumber, blockNumber, weth, topics);
+        assertEq(logs.length, 3);
+
+        for (uint256 i = 0; i < logs.length; i++) {
+            Vm.EthGetLogs memory log = logs[i];
+            assertEq(log.emitter, fixtureLogs[i].emitter);
+
+            string memory i_str;
+            if (i == 0) i_str = "0";
+            if (i == 1) i_str = "1";
+            if (i == 2) i_str = "2";
+
+            assertEq(log.blockNumber, vm.parseJsonUint(file, string.concat("[", i_str, "].blockNumber")));
+            assertEq(log.logIndex, vm.parseJsonUint(file, string.concat("[", i_str, "].logIndex")));
+            assertEq(log.transactionIndex, vm.parseJsonUint(file, string.concat("[", i_str, "].transactionIndex")));
+
+            assertEq(log.blockHash, fixtureLogs[i].blockHash);
+            assertEq(log.removed, fixtureLogs[i].removed);
+            assertEq(log.transactionHash, fixtureLogs[i].transactionHash);
+
+            // In this specific example, the log.data is bytes32
+            assertEq(bytes32(log.data), fixtureLogs[i].data);
+            assertEq(log.topics.length, 2);
+            assertEq(log.topics[0], withdrawalTopic);
+            assertEq(log.topics[1], fixtureLogs[i].topics[1]);
+        }
+    }
+
+    function testRpc() public {
+        vm.selectFork(mainnetFork);
+        string memory path = "fixtures/Rpc/balance_params.json";
+        string memory file = vm.readFile(path);
+        bytes memory result = vm.rpc("eth_getBalance", file);
+        assertEq(result, hex"10b7c11bcb51e6");
     }
 }
 
