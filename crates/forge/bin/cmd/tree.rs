@@ -1,25 +1,25 @@
 use clap::Parser;
-use ethers::solc::{
+use eyre::Result;
+use foundry_cli::{opts::ProjectPathsArgs, utils::LoadConfig};
+use foundry_compilers::{
     resolver::{Charset, TreeOptions},
     Graph,
 };
-use eyre::Result;
-use foundry_cli::{opts::ProjectPathsArgs, utils::LoadConfig};
 
 /// CLI arguments for `forge tree`.
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Debug, Parser)]
 pub struct TreeArgs {
     /// Do not de-duplicate (repeats all shared dependencies)
-    #[clap(long)]
+    #[arg(long)]
     no_dedupe: bool,
 
     /// Character set to use in output.
     ///
     /// [possible values: utf8, ascii]
-    #[clap(long, default_value = "utf8")]
+    #[arg(long, default_value = "utf8")]
     charset: Charset,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     opts: ProjectPathsArgs,
 }
 

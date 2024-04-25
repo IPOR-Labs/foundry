@@ -1,97 +1,144 @@
 //! # foundry-cheatcodes
 //!
-//! Foundry cheatcodes definitions and implementations.
+//! Foundry cheatcodes implementations.
 
 #![warn(missing_docs, unreachable_pub, unused_crate_dependencies, rust_2018_idioms)]
 #![allow(elided_lifetimes_in_paths)] // Cheats context uses 3 lifetimes
 
-#[cfg(feature = "impls")]
+#[macro_use]
+pub extern crate foundry_cheatcodes_spec as spec;
 #[macro_use]
 extern crate tracing;
 
-use alloy_primitives::{address, Address};
+use alloy_primitives::Address;
+use foundry_evm_core::backend::DatabaseExt;
+use revm::{ContextPrecompiles, InnerEvmContext};
 
-mod defs;
-pub use defs::{Cheatcode, CheatcodeDef, Group, Mutability, Safety, Status, Visibility, Vm};
+pub use config::CheatsConfig;
+pub use error::{Error, ErrorKind, Result};
+pub use inspector::{BroadcastableTransaction, BroadcastableTransactions, Cheatcodes, Context};
+pub use spec::{CheatcodeDef, Vm};
 
-#[cfg(feature = "impls")]
-pub mod impls;
-#[cfg(feature = "impls")]
-pub use impls::{Cheatcodes, CheatsConfig};
+#[macro_use]
+mod error;
+mod base64;
+mod config;
+mod env;
+mod evm;
+mod fs;
+mod inspector;
+mod json;
+mod script;
+mod string;
+mod test;
+mod toml;
+mod utils;
 
-/// The cheatcode handler address.
-///
-/// This is the same address as the one used in DappTools's HEVM.
-/// It is calculated as:
-/// `address(bytes20(uint160(uint256(keccak256('hevm cheat code')))))`
-pub const CHEATCODE_ADDRESS: Address = address!("7109709ECfa91a80626fF3989D68f67F5b1DD12D");
+pub use env::set_execution_context;
+pub use script::ScriptWallets;
+pub use test::expect::ExpectedCallTracker;
+pub use Vm::ForgeContext;
 
-/// The Hardhat console address.
-///
-/// See: <https://github.com/nomiclabs/hardhat/blob/master/packages/hardhat-core/console.sol>
-pub const HARDHAT_CONSOLE_ADDRESS: Address = address!("000000000000000000636F6e736F6c652e6c6f67");
-
-/// Address of the default `CREATE2` deployer.
-pub const DEFAULT_CREATE2_DEPLOYER: Address = address!("4e59b44847b379578588920ca78fbf26c0b4956c");
-
-/// Generates the `cheatcodes.json` file contents.
-pub fn json_cheatcodes() -> String {
-    serde_json::to_string_pretty(Vm::CHEATCODES).unwrap()
-}
-
-/// Generates the [cheatcodes](json_cheatcodes) JSON schema.
-#[cfg(feature = "schema")]
-pub fn json_schema() -> String {
-    // use a custom type to add a title and description to the schema
-    /// Foundry cheatcodes. Learn more: <https://book.getfoundry.sh/cheatcodes/>
-    #[derive(schemars::JsonSchema)]
-    struct Cheatcodes([Cheatcode<'static>]);
-
-    serde_json::to_string_pretty(&schemars::schema_for!(Cheatcodes)).unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::{fs, path::Path};
-
-    const JSON_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/cheatcodes.json");
-    #[cfg(feature = "schema")]
-    const SCHEMA_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/cheatcodes.schema.json");
-
-    #[test]
-    fn defs_up_to_date() {
-        ensure_file_contents(Path::new(JSON_PATH), &json_cheatcodes());
+/// Cheatcode implementation.
+pub(crate) trait Cheatcode: CheatcodeDef + DynCheatcode {
+    /// Applies this cheatcode to the given state.
+    ///
+    /// Implement this function if you don't need access to the EVM data.
+    fn apply(&self, state: &mut Cheatcodes) -> Result {
+        let _ = state;
+        unimplemented!("{}", Self::CHEATCODE.func.id)
     }
 
-    #[test]
-    #[cfg(feature = "schema")]
-    fn schema_up_to_date() {
-        ensure_file_contents(Path::new(SCHEMA_PATH), &json_schema());
+    /// Applies this cheatcode to the given context.
+    ///
+    /// Implement this function if you need access to the EVM data.
+    #[inline(always)]
+    fn apply_full<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
+        self.apply(ccx.state)
     }
 
-    /// Checks that the `file` has the specified `contents`. If that is not the
-    /// case, updates the file and then fails the test.
-    fn ensure_file_contents(file: &Path, contents: &str) {
-        if let Ok(old_contents) = fs::read_to_string(file) {
-            if normalize_newlines(&old_contents) == normalize_newlines(contents) {
-                // File is already up to date.
-                return
+    #[inline]
+    fn apply_traced<DB: DatabaseExt>(&self, ccx: &mut CheatsCtxt<DB>) -> Result {
+        let _span = trace_span_and_call(self);
+        let result = self.apply_full(ccx);
+        trace_return(&result);
+        return result;
+
+        // Separate and non-generic functions to avoid inline and monomorphization bloat.
+        #[inline(never)]
+        fn trace_span_and_call(cheat: &dyn DynCheatcode) -> tracing::span::EnteredSpan {
+            let span = debug_span!(target: "cheatcodes", "apply");
+            if !span.is_disabled() {
+                if enabled!(tracing::Level::TRACE) {
+                    span.record("cheat", tracing::field::debug(cheat.as_debug()));
+                } else {
+                    span.record("id", cheat.cheatcode().func.id);
+                }
             }
+            let entered = span.entered();
+            trace!(target: "cheatcodes", "applying");
+            entered
         }
 
-        eprintln!("\n\x1b[31;1merror\x1b[0m: {} was not up-to-date, updating\n", file.display());
-        if std::env::var("CI").is_ok() {
-            eprintln!("    NOTE: run `cargo test` locally and commit the updated files\n");
+        #[inline(never)]
+        fn trace_return(result: &Result) {
+            trace!(
+                target: "cheatcodes",
+                return = match result {
+                    Ok(b) => hex::encode(b),
+                    Err(e) => e.to_string(),
+                }
+            );
         }
-        if let Some(parent) = file.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        fs::write(file, contents).unwrap();
-        panic!("some file was not up to date and has been updated, simply re-run the tests");
+    }
+}
+
+pub(crate) trait DynCheatcode {
+    fn cheatcode(&self) -> &'static foundry_cheatcodes_spec::Cheatcode<'static>;
+    fn as_debug(&self) -> &dyn std::fmt::Debug;
+}
+
+impl<T: Cheatcode> DynCheatcode for T {
+    fn cheatcode(&self) -> &'static foundry_cheatcodes_spec::Cheatcode<'static> {
+        T::CHEATCODE
     }
 
-    fn normalize_newlines(s: &str) -> String {
-        s.replace("\r\n", "\n")
+    fn as_debug(&self) -> &dyn std::fmt::Debug {
+        self
+    }
+}
+
+/// The cheatcode context, used in [`Cheatcode`].
+pub(crate) struct CheatsCtxt<'cheats, 'evm, DB: DatabaseExt> {
+    /// The cheatcodes inspector state.
+    pub(crate) state: &'cheats mut Cheatcodes,
+    /// The EVM data.
+    pub(crate) ecx: &'evm mut InnerEvmContext<DB>,
+    /// The precompiles context.
+    pub(crate) precompiles: &'evm mut ContextPrecompiles<DB>,
+    /// The original `msg.sender`.
+    pub(crate) caller: Address,
+}
+
+impl<'cheats, 'evm, DB: DatabaseExt> std::ops::Deref for CheatsCtxt<'cheats, 'evm, DB> {
+    type Target = InnerEvmContext<DB>;
+
+    #[inline(always)]
+    fn deref(&self) -> &Self::Target {
+        self.ecx
+    }
+}
+
+impl<'cheats, 'evm, DB: DatabaseExt> std::ops::DerefMut for CheatsCtxt<'cheats, 'evm, DB> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.ecx
+    }
+}
+
+impl<'cheats, 'evm, DB: DatabaseExt> CheatsCtxt<'cheats, 'evm, DB> {
+    #[inline]
+    pub(crate) fn is_precompile(&self, address: &Address) -> bool {
+        self.precompiles.contains_key(address)
     }
 }

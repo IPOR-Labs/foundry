@@ -1,14 +1,13 @@
-//! Format buffer
-
-use std::fmt::Write;
+//! Format buffer.
 
 use crate::{
     comments::{CommentState, CommentStringExt},
     string::{QuoteState, QuotedStringExt},
 };
+use std::fmt::Write;
 
 /// An indent group. The group may optionally skip the first line
-#[derive(Default, Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct IndentGroup {
     skip_line: bool,
 }

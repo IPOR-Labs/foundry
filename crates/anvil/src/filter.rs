@@ -4,12 +4,10 @@ use crate::{
     pubsub::filter_logs,
     StorageInfo,
 };
+use alloy_primitives::TxHash;
+use alloy_rpc_types::{Filter, FilteredParams, Log as AlloyLog};
 use anvil_core::eth::subscription::SubscriptionId;
 use anvil_rpc::response::ResponseResult;
-use ethers::{
-    prelude::{Log as EthersLog, H256 as TxHash},
-    types::{Filter, FilteredParams},
-};
 use futures::{channel::mpsc::Receiver, Stream, StreamExt};
 use std::{
     collections::HashMap,
@@ -19,7 +17,6 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
-use tracing::{trace, warn};
 
 /// Type alias for filters identified by their id and their expiration timestamp
 type FilterMap = Arc<Mutex<HashMap<String, (EthFilter, Instant)>>>;
@@ -28,7 +25,7 @@ type FilterMap = Arc<Mutex<HashMap<String, (EthFilter, Instant)>>>;
 pub const ACTIVE_FILTER_TIMEOUT_SECS: u64 = 60 * 5;
 
 /// Contains all registered filters
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Filters {
     /// all currently active filters
     active_filters: FilterMap,
@@ -165,14 +162,14 @@ pub struct LogsFilter {
     /// existing logs that matched the filter when the listener was installed
     ///
     /// They'll be returned on the first pill
-    pub historic: Option<Vec<EthersLog>>,
+    pub historic: Option<Vec<AlloyLog>>,
 }
 
 // === impl LogsFilter ===
 
 impl LogsFilter {
     /// Returns all the logs since the last time this filter was polled
-    pub fn poll(&mut self, cx: &mut Context<'_>) -> Vec<EthersLog> {
+    pub fn poll(&mut self, cx: &mut Context<'_>) -> Vec<AlloyLog> {
         let mut logs = self.historic.take().unwrap_or_default();
         while let Poll::Ready(Some(block)) = self.blocks.poll_next_unpin(cx) {
             let b = self.storage.block(block.hash);

@@ -1,10 +1,9 @@
 use clap::{Parser, ValueHint};
 use eyre::Result;
-use forge_fmt::{format, parse, print_diagnostics_report};
+use forge_fmt::{format_to, parse, print_diagnostics_report};
 use foundry_cli::utils::{FoundryPathExt, LoadConfig};
-use foundry_common::{fs, term::cli_warn};
+use foundry_common::{fs, glob::expand_globs, term::cli_warn};
 use foundry_config::impl_figment_convert_basic;
-use foundry_utils::glob::expand_globs;
 use rayon::prelude::*;
 use similar::{ChangeTag, TextDiff};
 use std::{
@@ -13,32 +12,31 @@ use std::{
     io::{Read, Write as _},
     path::{Path, PathBuf},
 };
-use tracing::log::warn;
-use yansi::Color;
+use yansi::{Color, Paint, Style};
 
 /// CLI arguments for `forge fmt`.
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Debug, Parser)]
 pub struct FmtArgs {
     /// Path to the file, directory or '-' to read from stdin.
-    #[clap(value_hint = ValueHint::FilePath, value_name = "PATH", num_args(1..))]
+    #[arg(value_hint = ValueHint::FilePath, value_name = "PATH", num_args(1..))]
     paths: Vec<PathBuf>,
 
     /// The project's root path.
     ///
     /// By default root of the Git repository, if in one,
     /// or the current working directory.
-    #[clap(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
+    #[arg(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
     root: Option<PathBuf>,
 
     /// Run in 'check' mode.
     ///
     /// Exits with 0 if input is formatted correctly.
     /// Exits with 1 if formatting is required.
-    #[clap(long)]
+    #[arg(long)]
     check: bool,
 
     /// In 'check' and stdin modes, outputs raw formatted code instead of the diff.
-    #[clap(long, short)]
+    #[arg(long, short)]
     raw: bool,
 }
 
@@ -53,7 +51,7 @@ impl FmtArgs {
         // Expand ignore globs and canonicalize from the get go
         let ignored = expand_globs(&config.__root.0, config.fmt.ignore.iter())?
             .iter()
-            .flat_map(foundry_utils::path::canonicalize_path)
+            .flat_map(foundry_common::fs::canonicalize_path)
             .collect::<Vec<_>>();
 
         let cwd = std::env::current_dir()?;
@@ -83,7 +81,7 @@ impl FmtArgs {
                     }
 
                     if path.is_dir() {
-                        inputs.extend(ethers::solc::utils::source_files_iter(path));
+                        inputs.extend(foundry_compilers::utils::source_files_iter(path));
                     } else if path.is_sol() {
                         inputs.push(path.to_path_buf());
                     } else {
@@ -117,7 +115,7 @@ impl FmtArgs {
             }
 
             let mut output = String::new();
-            format(&mut output, parsed, config.fmt.clone()).unwrap();
+            format_to(&mut output, parsed, config.fmt.clone()).unwrap();
 
             solang_parser::parse(&output, 0).map_err(|diags| {
                 eyre::eyre!(
@@ -195,7 +193,7 @@ enum Input {
 }
 
 impl fmt::Display for Line {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             None => f.write_str("    "),
             Some(idx) => write!(f, "{:<4}", idx + 1),
@@ -219,24 +217,24 @@ where
         }
         for op in group {
             for change in diff.iter_inline_changes(&op) {
-                let dimmed = Color::Default.style().dimmed();
+                let dimmed = Style::new().dim();
                 let (sign, s) = match change.tag() {
-                    ChangeTag::Delete => ("-", Color::Red.style()),
-                    ChangeTag::Insert => ("+", Color::Green.style()),
+                    ChangeTag::Delete => ("-", Color::Red.foreground()),
+                    ChangeTag::Insert => ("+", Color::Green.foreground()),
                     ChangeTag::Equal => (" ", dimmed),
                 };
 
                 let _ = write!(
                     diff_summary,
                     "{}{} |{}",
-                    dimmed.paint(Line(change.old_index())),
-                    dimmed.paint(Line(change.new_index())),
-                    s.bold().paint(sign),
+                    Line(change.old_index()).paint(dimmed),
+                    Line(change.new_index()).paint(dimmed),
+                    sign.paint(s.bold()),
                 );
 
                 for (emphasized, value) in change.iter_strings_lossy() {
                     let s = if emphasized { s.underline().bg(Color::Black) } else { s };
-                    let _ = write!(diff_summary, "{}", s.paint(value));
+                    let _ = write!(diff_summary, "{}", value.paint(s));
                 }
 
                 if change.missing_newline() {

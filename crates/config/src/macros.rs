@@ -30,7 +30,7 @@
 ///         Metadata::default()
 ///     }
 ///
-///     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
+///     fn data(&self) -> std::result::Result<Map<Profile, Dict>, Error> {
 ///         let value = Value::serialize(self)?;
 ///         let error = InvalidType(value.to_actual(), "map".into());
 ///         let mut dict = value.into_dict().ok_or(error)?;
@@ -59,12 +59,10 @@ macro_rules! impl_figment_convert {
     ($name:ty) => {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
-                if let Some(root) = args.root.clone() {
-                    $crate::Config::figment_with_root(root)
-                } else {
-                    $crate::Config::figment_with_root($crate::find_project_root_path(None).unwrap())
-                }
-                .merge(args)
+                let root = args.root.clone()
+                    .unwrap_or_else(|| $crate::find_project_root_path(None)
+                        .unwrap_or_else(|e| panic!("could not find project root: {e}")));
+                $crate::Config::figment_with_root(root).merge(args)
             }
         }
 
@@ -79,8 +77,8 @@ macro_rules! impl_figment_convert {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
                 let mut figment: $crate::figment::Figment = From::from(&args.$start);
-                $ (
-                  figment =  figment.merge(&args.$more);
+                $(
+                    figment = figment.merge(&args.$more);
                 )*
                 figment
             }
@@ -97,8 +95,8 @@ macro_rules! impl_figment_convert {
         impl<'a> From<&'a $name> for $crate::figment::Figment {
             fn from(args: &'a $name) -> Self {
                 let mut figment: $crate::figment::Figment = From::from(&args.$start);
-                $ (
-                  figment =  figment.merge(&args.$more);
+                $(
+                    figment = figment.merge(&args.$more);
                 )*
                 figment = figment.merge(args);
                 figment
@@ -121,10 +119,11 @@ macro_rules! impl_figment_convert {
 /// Merge several nested `Provider` together with the type itself
 ///
 /// ```rust
+/// use foundry_config::{
+///     figment::{value::*, *},
+///     impl_figment_convert, merge_impl_figment_convert, Config,
+/// };
 /// use std::path::PathBuf;
-/// use foundry_config::{Config, merge_impl_figment_convert, impl_figment_convert};
-/// use foundry_config::figment::*;
-/// use foundry_config::figment::value::*;
 ///
 /// #[derive(Default)]
 /// struct MyArgs {
@@ -136,8 +135,8 @@ macro_rules! impl_figment_convert {
 ///         Metadata::default()
 ///     }
 ///
-///     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
-///        todo!()
+///     fn data(&self) -> std::result::Result<Map<Profile, Dict>, Error> {
+///         todo!()
 ///     }
 /// }
 ///
@@ -146,7 +145,7 @@ macro_rules! impl_figment_convert {
 /// #[derive(Default)]
 /// struct OuterArgs {
 ///     value: u64,
-///     inner: MyArgs
+///     inner: MyArgs,
 /// }
 ///
 /// impl Provider for OuterArgs {
@@ -154,8 +153,8 @@ macro_rules! impl_figment_convert {
 ///         Metadata::default()
 ///     }
 ///
-///     fn data(&self) -> Result<Map<Profile, Dict>, Error> {
-///             todo!()
+///     fn data(&self) -> std::result::Result<Map<Profile, Dict>, Error> {
+///         todo!()
 ///     }
 /// }
 ///

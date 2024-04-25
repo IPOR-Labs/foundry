@@ -8,7 +8,7 @@ use foundry_config::impl_figment_convert_basic;
 use std::path::PathBuf;
 
 /// CLI arguments for `forge remove`.
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Debug, Parser)]
 pub struct RemoveArgs {
     /// The dependencies you want to remove.
     dependencies: Vec<Dependency>,
@@ -17,11 +17,11 @@ pub struct RemoveArgs {
     ///
     /// By default root of the Git repository, if in one,
     /// or the current working directory.
-    #[clap(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
+    #[arg(long, value_hint = ValueHint::DirPath, value_name = "PATH")]
     root: Option<PathBuf>,
 
     /// Override the up-to-date check.
-    #[clap(short, long)]
+    #[arg(short, long)]
     force: bool,
 }
 impl_figment_convert_basic!(RemoveArgs);

@@ -1,12 +1,9 @@
 use super::{install, watch::WatchArgs};
 use clap::Parser;
-use ethers::solc::{Project, ProjectCompileOutput};
 use eyre::Result;
 use foundry_cli::{opts::CoreBuildArgs, utils::LoadConfig};
-use foundry_common::{
-    compile,
-    compile::{ProjectCompiler, SkipBuildFilter},
-};
+use foundry_common::compile::{ProjectCompiler, SkipBuildFilter, SkipBuildFilters};
+use foundry_compilers::{Project, ProjectCompileOutput};
 use foundry_config::{
     figment::{
         self,
@@ -42,33 +39,39 @@ foundry_config::merge_impl_figment_convert!(BuildArgs, args);
 ///
 /// Some arguments are marked as `#[serde(skip)]` and require manual processing in
 /// `figment::Provider` implementation
-#[derive(Debug, Clone, Parser, Serialize, Default)]
-#[clap(next_help_heading = "Build options", about = None, long_about = None)] // override doc
+#[derive(Clone, Debug, Default, Serialize, Parser)]
+#[command(next_help_heading = "Build options", about = None, long_about = None)] // override doc
 pub struct BuildArgs {
     /// Print compiled contract names.
-    #[clap(long)]
+    #[arg(long)]
     #[serde(skip)]
     pub names: bool,
 
     /// Print compiled contract sizes.
-    #[clap(long)]
+    #[arg(long)]
     #[serde(skip)]
     pub sizes: bool,
 
     /// Skip building files whose names contain the given filter.
     ///
     /// `test` and `script` are aliases for `.t.sol` and `.s.sol`.
-    #[clap(long, num_args(1..))]
+    #[arg(long, num_args(1..))]
     #[serde(skip)]
     pub skip: Option<Vec<SkipBuildFilter>>,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     #[serde(flatten)]
     pub args: CoreBuildArgs,
 
-    #[clap(flatten)]
+    #[command(flatten)]
     #[serde(skip)]
     pub watch: WatchArgs,
+
+    /// Output the compilation errors in the json format.
+    /// This is useful when you want to use the output in other tools.
+    #[arg(long, conflicts_with = "silent")]
+    #[serde(skip)]
+    pub format_json: bool,
 }
 
 impl BuildArgs {
@@ -84,14 +87,24 @@ impl BuildArgs {
             project = config.project()?;
         }
 
-        let filters = self.skip.unwrap_or_default();
-
-        if self.args.silent {
-            compile::suppress_compile_with_filter(&project, filters)
-        } else {
-            let compiler = ProjectCompiler::with_filter(self.names, self.sizes, filters);
-            compiler.compile(&project)
+        let mut compiler = ProjectCompiler::new()
+            .print_names(self.names)
+            .print_sizes(self.sizes)
+            .quiet(self.format_json)
+            .bail(!self.format_json);
+        if let Some(skip) = self.skip {
+            if !skip.is_empty() {
+                compiler = compiler
+                    .filter(Box::new(SkipBuildFilters::new(skip, project.root().to_path_buf())?));
+            }
         }
+        let output = compiler.compile(&project)?;
+
+        if self.format_json {
+            println!("{}", serde_json::to_string_pretty(&output.clone().output())?);
+        }
+
+        Ok(output)
     }
 
     /// Returns the `Project` for the current workspace
@@ -160,5 +173,13 @@ mod tests {
 
         let args: BuildArgs = BuildArgs::parse_from(["foundry-cli", "--skip", "tests", "scripts"]);
         assert_eq!(args.skip, Some(vec![SkipBuildFilter::Tests, SkipBuildFilter::Scripts]));
+    }
+
+    #[test]
+    fn check_conflicts() {
+        let args: std::result::Result<BuildArgs, clap::Error> =
+            BuildArgs::try_parse_from(["foundry-cli", "--format-json", "--silent"]);
+        assert!(args.is_err());
+        assert!(args.unwrap_err().kind() == clap::error::ErrorKind::ArgumentConflict);
     }
 }

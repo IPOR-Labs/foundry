@@ -33,7 +33,7 @@ pub fn parse(src: &str) -> Result<Parsed, Vec<Diagnostic>> {
 }
 
 /// Format parsed code
-pub fn format<W: Write>(
+pub fn format_to<W: Write>(
     writer: W,
     mut parsed: Parsed,
     config: FormatterConfig,
@@ -45,11 +45,14 @@ pub fn format<W: Write>(
 }
 
 /// Parse and format a string with default settings
-pub fn fmt(src: &str) -> Result<String, FormatterError> {
-    let parsed = parse(src).map_err(|_| FormatterError::Fmt(std::fmt::Error))?;
+pub fn format(src: &str) -> Result<String, FormatterError> {
+    let parsed = parse(src).map_err(|err| {
+        debug!(?err, "Parse error");
+        FormatterError::Fmt(std::fmt::Error)
+    })?;
 
     let mut output = String::new();
-    format(&mut output, parsed, FormatterConfig::default())?;
+    format_to(&mut output, parsed, FormatterConfig::default())?;
 
     Ok(output)
 }
@@ -78,6 +81,10 @@ pub fn print_diagnostics_report(
     path: Option<&Path>,
     diagnostics: Vec<Diagnostic>,
 ) -> std::io::Result<()> {
+    if diagnostics.is_empty() {
+        return Ok(());
+    }
+
     let filename =
         path.map(|p| p.file_name().unwrap().to_string_lossy().to_string()).unwrap_or_default();
     for diag in diagnostics {
@@ -103,5 +110,17 @@ pub fn import_path_string(path: &ImportPath) -> String {
     match path {
         ImportPath::Filename(s) => s.string.clone(),
         ImportPath::Path(p) => p.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // <https://github.com/foundry-rs/foundry/issues/6816>
+    #[test]
+    fn test_interface_format() {
+        let s = "interface I {\n    function increment() external;\n    function number() external view returns (uint256);\n    function setNumber(uint256 newNumber) external;\n}";
+        let _formatted = format(s).unwrap();
     }
 }

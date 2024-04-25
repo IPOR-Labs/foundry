@@ -1,5 +1,6 @@
-use ethers_core::types::{H256, U256, U64};
+use alloy_primitives::{TxHash, B256, U256, U64};
 use revm::primitives::SpecId;
+use std::collections::BTreeMap;
 
 #[cfg(feature = "serde")]
 use serde::{de::Error, Deserializer, Serializer};
@@ -7,7 +8,7 @@ use serde::{de::Error, Deserializer, Serializer};
 /// Represents the params to set forking which can take various forms
 ///  - untagged
 ///  - tagged `forking`
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Forking {
     pub json_rpc_url: Option<String>,
     pub block_number: Option<u64>,
@@ -23,6 +24,10 @@ impl<'de> serde::Deserialize<'de> for Forking {
         #[serde(rename_all = "camelCase")]
         struct ForkOpts {
             pub json_rpc_url: Option<String>,
+            #[serde(
+                default,
+                deserialize_with = "crate::eth::serde_helpers::numeric::deserialize_stringified_u64_opt"
+            )]
             pub block_number: Option<u64>,
         }
 
@@ -58,7 +63,7 @@ pub enum EvmMineOptions {
         #[cfg_attr(
             feature = "serde",
             serde(
-                deserialize_with = "ethers_core::types::serde_helpers::deserialize_stringified_u64_opt"
+                deserialize_with = "crate::eth::serde_helpers::numeric::deserialize_stringified_u64_opt"
             )
         )]
         timestamp: Option<u64>,
@@ -70,7 +75,7 @@ pub enum EvmMineOptions {
     #[cfg_attr(
         feature = "serde",
         serde(
-            deserialize_with = "ethers_core::types::serde_helpers::deserialize_stringified_u64_opt"
+            deserialize_with = "crate::eth::serde_helpers::numeric::deserialize_stringified_u64_opt"
         )
     )]
     Timestamp(Option<u64>),
@@ -84,11 +89,11 @@ impl Default for EvmMineOptions {
 
 /// Represents the result of `eth_getWork`
 /// This may or may not include the block number
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct Work {
-    pub pow_hash: H256,
-    pub seed_hash: H256,
-    pub target: H256,
+    pub pow_hash: B256,
+    pub seed_hash: B256,
+    pub target: B256,
     pub number: Option<u64>,
 }
 
@@ -107,7 +112,7 @@ impl serde::Serialize for Work {
 }
 
 /// A hex encoded or decimal index
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Index(usize);
 
 impl From<Index> for usize {
@@ -129,7 +134,7 @@ impl<'a> serde::Deserialize<'a> for Index {
         impl<'a> serde::de::Visitor<'a> for IndexVisitor {
             type Value = Index;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
                 write!(formatter, "hex-encoded or decimal index")
             }
 
@@ -168,34 +173,82 @@ impl<'a> serde::Deserialize<'a> for Index {
     }
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct NodeInfo {
     pub current_block_number: U64,
     pub current_block_timestamp: u64,
-    pub current_block_hash: H256,
+    pub current_block_hash: B256,
     pub hard_fork: SpecId,
     pub transaction_order: String,
     pub environment: NodeEnvironment,
     pub fork_config: NodeForkConfig,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct NodeEnvironment {
-    pub base_fee: U256,
-    pub chain_id: U256,
-    pub gas_limit: U256,
-    pub gas_price: U256,
+    pub base_fee: u128,
+    pub chain_id: u64,
+    pub gas_limit: u128,
+    pub gas_price: u128,
 }
 
-#[derive(Debug, Clone, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct NodeForkConfig {
     pub fork_url: Option<String>,
     pub fork_block_number: Option<u64>,
     pub fork_retry_backoff: Option<u128>,
+}
+
+/// Anvil equivalent of `hardhat_metadata`.
+/// Metadata about the current Anvil instance.
+/// See <https://hardhat.org/hardhat-network/docs/reference#hardhat_metadata>
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct AnvilMetadata {
+    pub client_version: &'static str,
+    pub chain_id: u64,
+    pub instance_id: B256,
+    pub latest_block_number: u64,
+    pub latest_block_hash: B256,
+    pub forked_network: Option<ForkedNetwork>,
+    pub snapshots: BTreeMap<U256, (u64, B256)>,
+}
+
+/// Information about the forked network.
+/// See <https://hardhat.org/hardhat-network/docs/reference#hardhat_metadata>
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
+pub struct ForkedNetwork {
+    pub chain_id: u64,
+    pub fork_block_number: u64,
+    pub fork_block_hash: TxHash,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serde_forking() {
+        let s = r#"{"forking": {"jsonRpcUrl": "https://ethereumpublicnode.com",
+        "blockNumber": "18441649"
+      }
+    }"#;
+        let f: Forking = serde_json::from_str(s).unwrap();
+        assert_eq!(
+            f,
+            Forking {
+                json_rpc_url: Some("https://ethereumpublicnode.com".into()),
+                block_number: Some(18441649)
+            }
+        );
+    }
 }

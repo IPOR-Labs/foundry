@@ -1,36 +1,36 @@
-use ethers::types::{
-    Action, Address, Block, Bytes, CallType, Trace, Transaction, TransactionReceipt, H256, U256,
-};
-use foundry_evm::{executor::InstructionResult, CallKind};
-use futures::future::join_all;
-use serde::{de::DeserializeOwned, Serialize};
-use serde_repr::Serialize_repr;
-
 use crate::eth::{
     backend::mem::{storage::MinedTransaction, Backend},
     error::{BlockchainError, Result},
 };
+use alloy_primitives::{Address, Bytes, B256, U256 as rU256, U256};
+use alloy_rpc_types::{Block, BlockTransactions, Transaction, WithOtherFields};
+use alloy_rpc_types_trace::parity::{Action, CallType, LocalizedTransactionTrace};
+use anvil_core::eth::transaction::ReceiptResponse;
+use foundry_evm::{revm::interpreter::InstructionResult, traces::CallKind};
+use futures::future::join_all;
+use serde::Serialize;
+use serde_repr::Serialize_repr;
 
 /// Patched Block struct, to include the additional `transactionCount` field expected by Otterscan
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", bound = "TX: Serialize + DeserializeOwned")]
-pub struct OtsBlock<TX> {
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OtsBlock {
     #[serde(flatten)]
-    pub block: Block<TX>,
+    pub block: Block,
     pub transaction_count: usize,
 }
 
 /// Block structure with additional details regarding fees and issuance
-#[derive(Serialize, Debug)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OtsBlockDetails {
-    pub block: OtsBlock<H256>,
+    pub block: OtsBlock,
     pub total_fees: U256,
     pub issuance: Issuance,
 }
 
 /// Issuance information for a block. Expected by Otterscan in ots_getBlockDetails calls
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Default, Serialize)]
 pub struct Issuance {
     block_reward: U256,
     uncle_reward: U256,
@@ -38,10 +38,10 @@ pub struct Issuance {
 }
 
 /// Holds both transactions and receipts for a block
-#[derive(Serialize, Debug)]
+#[derive(Clone, Serialize, Debug)]
 pub struct OtsBlockTransactions {
-    pub fullblock: OtsBlock<Transaction>,
-    pub receipts: Vec<TransactionReceipt>,
+    pub fullblock: OtsBlock,
+    pub receipts: Vec<ReceiptResponse>,
 }
 
 /// Patched Receipt struct, to include the additional `timestamp` field expected by Otterscan
@@ -49,29 +49,29 @@ pub struct OtsBlockTransactions {
 #[serde(rename_all = "camelCase")]
 pub struct OtsTransactionReceipt {
     #[serde(flatten)]
-    receipt: TransactionReceipt,
+    receipt: ReceiptResponse,
     timestamp: u64,
 }
 
 /// Information about the creator address and transaction for a contract
-#[derive(Serialize, Debug)]
+#[derive(Debug, Serialize)]
 pub struct OtsContractCreator {
-    pub hash: H256,
+    pub hash: B256,
     pub creator: Address,
 }
 
 /// Paginated search results of an account's history
-#[derive(Serialize, Debug)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OtsSearchTransactions {
-    pub txs: Vec<Transaction>,
+    pub txs: Vec<WithOtherFields<Transaction>>,
     pub receipts: Vec<OtsTransactionReceipt>,
     pub first_page: bool,
     pub last_page: bool,
 }
 
 /// Otterscan format for listing relevant internal operations
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OtsInternalOperation {
     pub r#type: OtsInternalOperationType,
@@ -81,7 +81,7 @@ pub struct OtsInternalOperation {
 }
 
 /// Types of internal operations recognized by Otterscan
-#[derive(Serialize_repr, Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize_repr)]
 #[repr(u8)]
 pub enum OtsInternalOperationType {
     Transfer = 0,
@@ -91,7 +91,7 @@ pub enum OtsInternalOperationType {
 }
 
 /// Otterscan's representation of a trace
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 pub struct OtsTrace {
     pub r#type: OtsTraceType,
     pub depth: usize,
@@ -103,7 +103,7 @@ pub struct OtsTrace {
 
 /// The type of call being described by an Otterscan trace. Only CALL, STATICCALL and DELEGATECALL
 /// are represented
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum OtsTraceType {
     Call,
@@ -123,27 +123,32 @@ impl OtsBlockDetails {
     ///   - It breaks the abstraction built in `OtsBlock<TX>` which computes `transaction_count`
     ///   based on the existing list.
     /// Therefore we keep it simple by keeping the data in the response
-    pub async fn build(block: Block<H256>, backend: &Backend) -> Result<Self> {
+    pub async fn build(block: Block, backend: &Backend) -> Result<Self> {
+        let block_txs = match block.transactions.clone() {
+            BlockTransactions::Full(txs) => txs.into_iter().map(|tx| tx.hash).collect(),
+            BlockTransactions::Hashes(txs) => txs,
+            BlockTransactions::Uncle => return Err(BlockchainError::DataUnavailable),
+        };
         let receipts_futs =
-            block.transactions.iter().map(|tx| async { backend.transaction_receipt(*tx).await });
+            block_txs.iter().map(|tx| async { backend.transaction_receipt(*tx).await });
 
         // fetch all receipts
-        let receipts: Vec<TransactionReceipt> = join_all(receipts_futs)
+        let receipts = join_all(receipts_futs)
             .await
             .into_iter()
             .map(|r| match r {
                 Ok(Some(r)) => Ok(r),
                 _ => Err(BlockchainError::DataUnavailable),
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
-        let total_fees = receipts.iter().fold(U256::zero(), |acc, receipt| {
-            acc + receipt.gas_used.unwrap() * (receipt.effective_gas_price.unwrap())
-        });
+        let total_fees = receipts
+            .iter()
+            .fold(0, |acc, receipt| acc + receipt.gas_used * receipt.effective_gas_price);
 
         Ok(Self {
             block: block.into(),
-            total_fees,
+            total_fees: U256::from(total_fees),
             // issuance has no meaningful value in anvil's backend. just default to 0
             issuance: Default::default(),
         })
@@ -152,9 +157,13 @@ impl OtsBlockDetails {
 
 /// Converts a regular block into the patched OtsBlock format
 /// which includes the `transaction_count` field
-impl<TX> From<Block<TX>> for OtsBlock<TX> {
-    fn from(block: Block<TX>) -> Self {
-        let transaction_count = block.transactions.len();
+impl From<Block> for OtsBlock {
+    fn from(block: Block) -> Self {
+        let transaction_count = match block.transactions {
+            BlockTransactions::Full(ref txs) => txs.len(),
+            BlockTransactions::Hashes(ref txs) => txs.len(),
+            BlockTransactions::Uncle => 0,
+        };
 
         Self { block, transaction_count }
     }
@@ -163,20 +172,34 @@ impl<TX> From<Block<TX>> for OtsBlock<TX> {
 impl OtsBlockTransactions {
     /// Fetches all receipts for the blocks's transactions, as required by the [`ots_getBlockTransactions`](https://github.com/otterscan/otterscan/blob/develop/docs/custom-jsonrpc.md#ots_getblockdetails) endpoint spec, and returns the final response object.
     pub async fn build(
-        mut block: Block<Transaction>,
+        mut block: Block,
         backend: &Backend,
         page: usize,
         page_size: usize,
     ) -> Result<Self> {
-        block.transactions =
-            block.transactions.into_iter().skip(page * page_size).take(page_size).collect();
+        let block_txs = match block.transactions.clone() {
+            BlockTransactions::Full(txs) => txs.into_iter().map(|tx| tx.hash).collect(),
+            BlockTransactions::Hashes(txs) => txs,
+            BlockTransactions::Uncle => return Err(BlockchainError::DataUnavailable),
+        };
 
-        let receipt_futs = block
-            .transactions
-            .iter()
-            .map(|tx| async { backend.transaction_receipt(tx.hash).await });
+        let block_txs =
+            block_txs.into_iter().skip(page * page_size).take(page_size).collect::<Vec<_>>();
 
-        let receipts: Vec<TransactionReceipt> = join_all(receipt_futs)
+        block.transactions = match block.transactions {
+            BlockTransactions::Full(txs) => BlockTransactions::Full(
+                txs.into_iter().skip(page * page_size).take(page_size).collect(),
+            ),
+            BlockTransactions::Hashes(txs) => BlockTransactions::Hashes(
+                txs.into_iter().skip(page * page_size).take(page_size).collect(),
+            ),
+            BlockTransactions::Uncle => return Err(BlockchainError::DataUnavailable),
+        };
+
+        let receipt_futs =
+            block_txs.iter().map(|tx| async { backend.transaction_receipt(*tx).await });
+
+        let receipts = join_all(receipt_futs)
             .await
             .into_iter()
             .map(|r| match r {
@@ -185,7 +208,7 @@ impl OtsBlockTransactions {
             })
             .collect::<Result<_>>()?;
 
-        let fullblock: OtsBlock<_> = block.into();
+        let fullblock: OtsBlock = block.into();
 
         Ok(Self { fullblock, receipts })
     }
@@ -196,14 +219,14 @@ impl OtsSearchTransactions {
     /// `ots_searchTransactionsAfter`](lrequires not only the transactions, but also the
     /// corresponding receipts, which are fetched here before constructing the final)
     pub async fn build(
-        hashes: Vec<H256>,
+        hashes: Vec<B256>,
         backend: &Backend,
         first_page: bool,
         last_page: bool,
     ) -> Result<Self> {
         let txs_futs = hashes.iter().map(|hash| async { backend.transaction_by_hash(*hash).await });
 
-        let txs: Vec<Transaction> = join_all(txs_futs)
+        let txs: Vec<_> = join_all(txs_futs)
             .await
             .into_iter()
             .map(|t| match t {
@@ -237,37 +260,38 @@ impl OtsInternalOperation {
         traces
             .info
             .traces
-            .arena
             .iter()
-            .filter_map(|node| match (node.kind(), node.status()) {
-                (CallKind::Call, _) if !node.trace.value.is_zero() => Some(Self {
-                    r#type: OtsInternalOperationType::Transfer,
-                    from: node.trace.caller,
-                    to: node.trace.address,
-                    value: node.trace.value,
-                }),
-                (CallKind::Create, _) => Some(Self {
-                    r#type: OtsInternalOperationType::Create,
-                    from: node.trace.caller,
-                    to: node.trace.address,
-                    value: node.trace.value,
-                }),
-                (CallKind::Create2, _) => Some(Self {
-                    r#type: OtsInternalOperationType::Create2,
-                    from: node.trace.caller,
-                    to: node.trace.address,
-                    value: node.trace.value,
-                }),
-                (_, InstructionResult::SelfDestruct) => {
-                    Some(Self {
-                        r#type: OtsInternalOperationType::SelfDestruct,
-                        from: node.trace.address,
-                        // the foundry CallTraceNode doesn't have a refund address
-                        to: Default::default(),
+            .filter_map(|node| {
+                match (node.trace.kind, node.trace.status) {
+                    (CallKind::Call, _) if node.trace.value != rU256::ZERO => Some(Self {
+                        r#type: OtsInternalOperationType::Transfer,
+                        from: node.trace.caller,
+                        to: node.trace.address,
                         value: node.trace.value,
-                    })
+                    }),
+                    (CallKind::Create, _) => Some(Self {
+                        r#type: OtsInternalOperationType::Create,
+                        from: node.trace.caller,
+                        to: node.trace.address,
+                        value: node.trace.value,
+                    }),
+                    (CallKind::Create2, _) => Some(Self {
+                        r#type: OtsInternalOperationType::Create2,
+                        from: node.trace.caller,
+                        to: node.trace.address,
+                        value: node.trace.value,
+                    }),
+                    (_, InstructionResult::SelfDestruct) => {
+                        Some(Self {
+                            r#type: OtsInternalOperationType::SelfDestruct,
+                            from: node.trace.address,
+                            // the foundry CallTraceNode doesn't have a refund address
+                            to: Default::default(),
+                            value: node.trace.value,
+                        })
+                    }
+                    _ => None,
                 }
-                _ => None,
             })
             .collect()
     }
@@ -276,26 +300,26 @@ impl OtsInternalOperation {
 impl OtsTrace {
     /// Converts the list of traces for a transaction into the expected Otterscan format, as
     /// specified in the [`ots_traceTransaction`](https://github.com/otterscan/otterscan/blob/develop/docs/custom-jsonrpc.md#ots_tracetransaction) spec
-    pub fn batch_build(traces: Vec<Trace>) -> Vec<Self> {
+    pub fn batch_build(traces: Vec<LocalizedTransactionTrace>) -> Vec<Self> {
         traces
             .into_iter()
-            .filter_map(|trace| match trace.action {
+            .filter_map(|trace| match trace.trace.action {
                 Action::Call(call) => {
                     if let Ok(ots_type) = call.call_type.try_into() {
                         Some(OtsTrace {
                             r#type: ots_type,
-                            depth: trace.trace_address.len(),
+                            depth: trace.trace.trace_address.len(),
                             from: call.from,
                             to: call.to,
                             value: call.value,
-                            input: call.input,
+                            input: call.input.0.into(),
                         })
                     } else {
                         None
                     }
                 }
                 Action::Create(_) => None,
-                Action::Suicide(_) => None,
+                Action::Selfdestruct(_) => None,
                 Action::Reward(_) => None,
             })
             .collect()

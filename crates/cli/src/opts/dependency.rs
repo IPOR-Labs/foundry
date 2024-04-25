@@ -35,7 +35,7 @@ const COMMON_ORG_ALIASES: &[(&str, &str); 2] =
 ///
 /// Non Github URLs must be provided with an https:// prefix.
 /// Adding dependencies as local paths is not supported yet.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Dependency {
     /// The name of the dependency
     pub name: String,
@@ -139,7 +139,7 @@ impl Dependency {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ethers::solc::info::ContractInfo;
+    use foundry_compilers::info::ContractInfo;
 
     #[test]
     fn parses_dependencies() {

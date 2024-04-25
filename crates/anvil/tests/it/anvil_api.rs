@@ -1,19 +1,22 @@
 //! tests for custom anvil endpoints
-use crate::{abi::*, fork::fork_config};
-use anvil::{spawn, Hardfork, NodeConfig};
+use crate::{abi::*, fork::fork_config, utils::ethers_http_provider};
+use alloy_rpc_types::BlockNumberOrTag;
+use anvil::{eth::api::CLIENT_VERSION, spawn, Hardfork, NodeConfig};
 use anvil_core::{
     eth::EthRequest,
-    types::{NodeEnvironment, NodeForkConfig, NodeInfo},
+    types::{AnvilMetadata, ForkedNetwork, Forking, NodeEnvironment, NodeForkConfig, NodeInfo},
 };
 use ethers::{
     abi::{ethereum_types::BigEndianHash, AbiDecode},
     prelude::{Middleware, SignerMiddleware},
+    signers::Signer,
     types::{
         transaction::eip2718::TypedTransaction, Address, BlockNumber, Eip1559TransactionRequest,
         TransactionRequest, H256, U256, U64,
     },
     utils::hex,
 };
+use foundry_common::types::{ToAlloy, ToEthers};
 use foundry_evm::revm::primitives::SpecId;
 use std::{
     str::FromStr,
@@ -24,10 +27,10 @@ use std::{
 #[tokio::test(flavor = "multi_thread")]
 async fn can_set_gas_price() {
     let (api, handle) = spawn(NodeConfig::test().with_hardfork(Some(Hardfork::Berlin))).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
-    let gas_price = 1337u64.into();
-    api.anvil_set_min_gas_price(gas_price).await.unwrap();
+    let gas_price: U256 = 1337u64.into();
+    api.anvil_set_min_gas_price(gas_price.to_alloy()).await.unwrap();
     assert_eq!(gas_price, provider.get_gas_price().await.unwrap());
 }
 
@@ -35,12 +38,13 @@ async fn can_set_gas_price() {
 async fn can_set_block_gas_limit() {
     let (api, _) = spawn(NodeConfig::test().with_hardfork(Some(Hardfork::Berlin))).await;
 
-    let block_gas_limit = 1337u64.into();
-    assert!(api.evm_set_block_gas_limit(block_gas_limit).unwrap());
+    let block_gas_limit: U256 = 1337u64.into();
+    assert!(api.evm_set_block_gas_limit(block_gas_limit.to_alloy()).unwrap());
     // Mine a new block, and check the new block gas limit
     api.mine_one().await;
-    let latest_block = api.block_by_number(BlockNumber::Latest).await.unwrap().unwrap();
-    assert_eq!(block_gas_limit, latest_block.gas_limit);
+    let latest_block =
+        api.block_by_number(alloy_rpc_types::BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(block_gas_limit.as_u128(), latest_block.header.gas_limit);
 }
 
 // Ref <https://github.com/foundry-rs/foundry/issues/2341>
@@ -58,31 +62,31 @@ async fn can_set_storage() {
 
     let storage_value = api.storage_at(addr, slot, None).await.unwrap();
     assert_eq!(val, storage_value);
-    assert_eq!(val, H256::from_uint(&U256::from(12345)));
+    assert_eq!(val.to_ethers(), H256::from_uint(&U256::from(12345)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn can_impersonate_account() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let impersonate = Address::random();
     let to = Address::random();
     let val = 1337u64;
     let funding = U256::from(1e18 as u64);
     // fund the impersonated account
-    api.anvil_set_balance(impersonate, funding).await.unwrap();
+    api.anvil_set_balance(impersonate.to_alloy(), funding.to_alloy()).await.unwrap();
 
-    let balance = api.balance(impersonate, None).await.unwrap();
-    assert_eq!(balance, funding);
+    let balance = api.balance(impersonate.to_alloy(), None).await.unwrap();
+    assert_eq!(balance, funding.to_alloy());
 
     let tx = TransactionRequest::new().from(impersonate).to(to).value(val);
 
     let res = provider.send_transaction(tx.clone(), None).await;
     res.unwrap_err();
 
-    api.anvil_impersonate_account(impersonate).await.unwrap();
-    assert!(api.accounts().unwrap().contains(&impersonate));
+    api.anvil_impersonate_account(impersonate.to_alloy()).await.unwrap();
+    assert!(api.accounts().unwrap().contains(&impersonate.to_alloy()));
 
     let res = provider.send_transaction(tx.clone(), None).await.unwrap().await.unwrap().unwrap();
     assert_eq!(res.from, impersonate);
@@ -93,7 +97,7 @@ async fn can_impersonate_account() {
     let balance = provider.get_balance(to, None).await.unwrap();
     assert_eq!(balance, val.into());
 
-    api.anvil_stop_impersonating_account(impersonate).await.unwrap();
+    api.anvil_stop_impersonating_account(impersonate.to_alloy()).await.unwrap();
     let res = provider.send_transaction(tx, None).await;
     res.unwrap_err();
 }
@@ -101,17 +105,17 @@ async fn can_impersonate_account() {
 #[tokio::test(flavor = "multi_thread")]
 async fn can_auto_impersonate_account() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let impersonate = Address::random();
     let to = Address::random();
     let val = 1337u64;
     let funding = U256::from(1e18 as u64);
     // fund the impersonated account
-    api.anvil_set_balance(impersonate, funding).await.unwrap();
+    api.anvil_set_balance(impersonate.to_alloy(), funding.to_alloy()).await.unwrap();
 
-    let balance = api.balance(impersonate, None).await.unwrap();
-    assert_eq!(balance, funding);
+    let balance = api.balance(impersonate.to_alloy(), None).await.unwrap();
+    assert_eq!(balance, funding.to_alloy());
 
     let tx = TransactionRequest::new().from(impersonate).to(to).value(val);
 
@@ -134,16 +138,16 @@ async fn can_auto_impersonate_account() {
     res.unwrap_err();
 
     // explicitly impersonated accounts get returned by `eth_accounts`
-    api.anvil_impersonate_account(impersonate).await.unwrap();
-    assert!(api.accounts().unwrap().contains(&impersonate));
+    api.anvil_impersonate_account(impersonate.to_alloy()).await.unwrap();
+    assert!(api.accounts().unwrap().contains(&impersonate.to_alloy()));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn can_impersonate_contract() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
-    let wallet = handle.dev_wallets().next().unwrap();
+    let wallet = handle.dev_wallets().next().unwrap().to_ethers();
     let provider = Arc::new(SignerMiddleware::new(provider, wallet));
 
     let greeter_contract =
@@ -153,10 +157,12 @@ async fn can_impersonate_contract() {
     let to = Address::random();
     let val = 1337u64;
 
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     // fund the impersonated account
-    api.anvil_set_balance(impersonate, U256::from(1e18 as u64)).await.unwrap();
+    api.anvil_set_balance(impersonate.to_alloy(), U256::from(1e18 as u64).to_alloy())
+        .await
+        .unwrap();
 
     let tx = TransactionRequest::new().from(impersonate).to(to).value(val);
 
@@ -166,7 +172,7 @@ async fn can_impersonate_contract() {
     let greeting = greeter_contract.greet().call().await.unwrap();
     assert_eq!("Hello World!", greeting);
 
-    api.anvil_impersonate_account(impersonate).await.unwrap();
+    api.anvil_impersonate_account(impersonate.to_alloy()).await.unwrap();
 
     let res = provider.send_transaction(tx.clone(), None).await.unwrap().await.unwrap().unwrap();
     assert_eq!(res.from, impersonate);
@@ -174,7 +180,7 @@ async fn can_impersonate_contract() {
     let balance = provider.get_balance(to, None).await.unwrap();
     assert_eq!(balance, val.into());
 
-    api.anvil_stop_impersonating_account(impersonate).await.unwrap();
+    api.anvil_stop_impersonating_account(impersonate.to_alloy()).await.unwrap();
     let res = provider.send_transaction(tx, None).await;
     res.unwrap_err();
 
@@ -185,27 +191,27 @@ async fn can_impersonate_contract() {
 #[tokio::test(flavor = "multi_thread")]
 async fn can_impersonate_gnosis_safe() {
     let (api, handle) = spawn(fork_config()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
-    // <https://help.gnosis-safe.io/en/articles/4971293-i-don-t-remember-my-safe-address-where-can-i-find-it>
+    // <https://help.safe.global/en/articles/40824-i-don-t-remember-my-safe-address-where-can-i-find-it>
     let safe: Address = "0xA063Cb7CFd8E57c30c788A0572CBbf2129ae56B6".parse().unwrap();
 
     let code = provider.get_code(safe, None).await.unwrap();
     assert!(!code.is_empty());
 
-    api.anvil_impersonate_account(safe).await.unwrap();
+    api.anvil_impersonate_account(safe.to_alloy()).await.unwrap();
 
     let code = provider.get_code(safe, None).await.unwrap();
     assert!(!code.is_empty());
 
     let balance = U256::from(1e18 as u64);
     // fund the impersonated account
-    api.anvil_set_balance(safe, balance).await.unwrap();
+    api.anvil_set_balance(safe.to_alloy(), balance.to_alloy()).await.unwrap();
 
     let on_chain_balance = provider.get_balance(safe, None).await.unwrap();
     assert_eq!(on_chain_balance, balance);
 
-    api.anvil_stop_impersonating_account(safe).await.unwrap();
+    api.anvil_stop_impersonating_account(safe.to_alloy()).await.unwrap();
 
     let code = provider.get_code(safe, None).await.unwrap();
     // code is added back after stop impersonating
@@ -215,7 +221,7 @@ async fn can_impersonate_gnosis_safe() {
 #[tokio::test(flavor = "multi_thread")]
 async fn can_impersonate_multiple_account() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let impersonate0 = Address::random();
     let impersonate1 = Address::random();
@@ -224,13 +230,13 @@ async fn can_impersonate_multiple_account() {
     let val = 1337u64;
     let funding = U256::from(1e18 as u64);
     // fund the impersonated accounts
-    api.anvil_set_balance(impersonate0, funding).await.unwrap();
-    api.anvil_set_balance(impersonate1, funding).await.unwrap();
+    api.anvil_set_balance(impersonate0.to_alloy(), funding.to_alloy()).await.unwrap();
+    api.anvil_set_balance(impersonate1.to_alloy(), funding.to_alloy()).await.unwrap();
 
     let tx = TransactionRequest::new().from(impersonate0).to(to).value(val);
 
-    api.anvil_impersonate_account(impersonate0).await.unwrap();
-    api.anvil_impersonate_account(impersonate1).await.unwrap();
+    api.anvil_impersonate_account(impersonate0.to_alloy()).await.unwrap();
+    api.anvil_impersonate_account(impersonate1.to_alloy()).await.unwrap();
 
     let res0 = provider.send_transaction(tx.clone(), None).await.unwrap().await.unwrap().unwrap();
     assert_eq!(res0.from, impersonate0);
@@ -262,7 +268,7 @@ async fn can_impersonate_multiple_account() {
 #[tokio::test(flavor = "multi_thread")]
 async fn can_mine_manually() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let start_num = provider.get_block_number().await.unwrap();
 
@@ -276,7 +282,7 @@ async fn can_mine_manually() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_set_next_timestamp() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
 
@@ -303,7 +309,7 @@ async fn test_set_next_timestamp() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_evm_set_time() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
 
@@ -327,7 +333,7 @@ async fn test_evm_set_time() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_evm_set_time_in_past() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let now = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
 
@@ -347,7 +353,7 @@ async fn test_evm_set_time_in_past() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_timestamp_interval() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     api.evm_mine(None).await.unwrap();
     let interval = 10;
@@ -398,7 +404,7 @@ async fn test_timestamp_interval() {
 async fn test_can_set_storage_bsc_fork() {
     let (api, handle) =
         spawn(NodeConfig::test().with_eth_rpc_url(Some("https://bsc-dataseed.binance.org/"))).await;
-    let provider = Arc::new(handle.http_provider());
+    let provider = Arc::new(ethers_http_provider(&handle.http_endpoint()));
 
     let busd_addr: Address = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56".parse().unwrap();
     let idx: U256 =
@@ -406,9 +412,9 @@ async fn test_can_set_storage_bsc_fork() {
     let value: H256 =
         "0x0000000000000000000000000000000000000000000000000000000000003039".parse().unwrap();
 
-    api.anvil_set_storage_at(busd_addr, idx, value).await.unwrap();
-    let storage = api.storage_at(busd_addr, idx, None).await.unwrap();
-    assert_eq!(storage, value);
+    api.anvil_set_storage_at(busd_addr.to_alloy(), idx.to_alloy(), value.to_alloy()).await.unwrap();
+    let storage = api.storage_at(busd_addr.to_alloy(), idx.to_alloy(), None).await.unwrap();
+    assert_eq!(storage.to_ethers(), value);
 
     let input =
         hex::decode("70a082310000000000000000000000000000000000000000000000000000000000000000")
@@ -427,22 +433,22 @@ async fn can_get_node_info() {
 
     let node_info = api.anvil_node_info().await.unwrap();
 
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     let block_number = provider.get_block_number().await.unwrap();
     let block = provider.get_block(block_number).await.unwrap().unwrap();
 
     let expected_node_info = NodeInfo {
-        current_block_number: U64([0]),
+        current_block_number: U64([0]).to_alloy(),
         current_block_timestamp: 1,
-        current_block_hash: block.hash.unwrap(),
-        hard_fork: SpecId::SHANGHAI,
+        current_block_hash: block.hash.unwrap().to_alloy(),
+        hard_fork: SpecId::CANCUN,
         transaction_order: "fees".to_owned(),
         environment: NodeEnvironment {
-            base_fee: U256::from_str("0x3b9aca00").unwrap(),
-            chain_id: U256::from_str("0x7a69").unwrap(),
-            gas_limit: U256::from_str("0x1c9c380").unwrap(),
-            gas_price: U256::from_str("0x77359400").unwrap(),
+            base_fee: alloy_primitives::U256::from_str("0x3b9aca00").unwrap().to(),
+            chain_id: 0x7a69,
+            gas_limit: alloy_primitives::U256::from_str("0x1c9c380").unwrap().to(),
+            gas_price: alloy_primitives::U256::from_str("0x77359400").unwrap().to(),
         },
         fork_config: NodeForkConfig {
             fork_url: None,
@@ -455,13 +461,83 @@ async fn can_get_node_info() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn can_get_metadata() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+
+    let metadata = api.anvil_metadata().await.unwrap();
+
+    let provider = ethers_http_provider(&handle.http_endpoint());
+
+    let block_number = provider.get_block_number().await.unwrap().as_u64();
+    let chain_id = provider.get_chainid().await.unwrap().as_u64();
+    let block = provider.get_block(block_number).await.unwrap().unwrap();
+
+    let expected_metadata = AnvilMetadata {
+        latest_block_hash: block.hash.unwrap().to_alloy(),
+        latest_block_number: block_number,
+        chain_id,
+        client_version: CLIENT_VERSION,
+        instance_id: api.instance_id(),
+        forked_network: None,
+        snapshots: Default::default(),
+    };
+
+    assert_eq!(metadata, expected_metadata);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_get_metadata_on_fork() {
+    let (api, handle) =
+        spawn(NodeConfig::test().with_eth_rpc_url(Some("https://bsc-dataseed.binance.org/"))).await;
+    let provider = Arc::new(ethers_http_provider(&handle.http_endpoint()));
+
+    let metadata = api.anvil_metadata().await.unwrap();
+
+    let block_number = provider.get_block_number().await.unwrap().as_u64();
+    let chain_id = provider.get_chainid().await.unwrap().as_u64();
+    let block = provider.get_block(block_number).await.unwrap().unwrap();
+
+    let expected_metadata = AnvilMetadata {
+        latest_block_hash: block.hash.unwrap().to_alloy(),
+        latest_block_number: block_number,
+        chain_id,
+        client_version: CLIENT_VERSION,
+        instance_id: api.instance_id(),
+        forked_network: Some(ForkedNetwork {
+            chain_id,
+            fork_block_number: block_number,
+            fork_block_hash: block.hash.unwrap().to_alloy(),
+        }),
+        snapshots: Default::default(),
+    };
+
+    assert_eq!(metadata, expected_metadata);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn metadata_changes_on_reset() {
+    let (api, _) =
+        spawn(NodeConfig::test().with_eth_rpc_url(Some("https://bsc-dataseed.binance.org/"))).await;
+
+    let metadata = api.anvil_metadata().await.unwrap();
+    let instance_id = metadata.instance_id;
+
+    api.anvil_reset(Some(Forking { json_rpc_url: None, block_number: None })).await.unwrap();
+
+    let new_metadata = api.anvil_metadata().await.unwrap();
+    let new_instance_id = new_metadata.instance_id;
+
+    assert_ne!(instance_id, new_instance_id);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_get_transaction_receipt() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
 
     // set the base fee
     let new_base_fee = U256::from(1_000);
-    api.anvil_set_next_block_base_fee_per_gas(new_base_fee).await.unwrap();
+    api.anvil_set_next_block_base_fee_per_gas(new_base_fee.to_alloy()).await.unwrap();
 
     // send a EIP-1559 transaction
     let tx =
@@ -488,7 +564,7 @@ async fn test_get_transaction_receipt() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_set_chain_id() {
     let (api, handle) = spawn(NodeConfig::test()).await;
-    let provider = handle.http_provider();
+    let provider = ethers_http_provider(&handle.http_endpoint());
     let chain_id = provider.get_chainid().await.unwrap();
     assert_eq!(chain_id, U256::from(31337));
 
@@ -497,4 +573,86 @@ async fn test_set_chain_id() {
 
     let chain_id = provider.get_chainid().await.unwrap();
     assert_eq!(chain_id, U256::from(1234));
+}
+
+// <https://github.com/foundry-rs/foundry/issues/6096>
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fork_revert_next_block_timestamp() {
+    let (api, _handle) = spawn(fork_config()).await;
+
+    // Mine a new block, and check the new block gas limit
+    api.mine_one().await;
+    let latest_block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+
+    let snapshot_id = api.evm_snapshot().await.unwrap();
+    api.mine_one().await;
+    api.evm_revert(snapshot_id).await.unwrap();
+    let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert_eq!(block, latest_block);
+
+    api.mine_one().await;
+    let block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+    assert!(block.header.timestamp > latest_block.header.timestamp);
+}
+
+// test that after a snapshot revert, the env block is reset
+// to its correct value (block number, etc.)
+#[tokio::test(flavor = "multi_thread")]
+async fn test_fork_revert_call_latest_block_timestamp() {
+    let (api, handle) = spawn(fork_config()).await;
+    let provider = ethers_http_provider(&handle.http_endpoint());
+
+    // Mine a new block, and check the new block gas limit
+    api.mine_one().await;
+    let latest_block = api.block_by_number(BlockNumberOrTag::Latest).await.unwrap().unwrap();
+
+    let snapshot_id = api.evm_snapshot().await.unwrap();
+    api.mine_one().await;
+    api.evm_revert(snapshot_id).await.unwrap();
+
+    let multicall = MulticallContract::new(
+        Address::from_str("0xeefba1e63905ef1d7acba5a8513c70307c1ce441").unwrap(),
+        provider.into(),
+    );
+
+    assert_eq!(
+        multicall.get_current_block_timestamp().await.unwrap().as_u64(),
+        latest_block.header.timestamp
+    );
+    assert_eq!(
+        multicall.get_current_block_difficulty().await.unwrap(),
+        latest_block.header.difficulty.to_ethers()
+    );
+    assert_eq!(
+        multicall.get_current_block_gas_limit().await.unwrap().as_u128(),
+        latest_block.header.gas_limit
+    );
+    assert_eq!(
+        multicall.get_current_block_coinbase().await.unwrap(),
+        latest_block.header.miner.to_ethers()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn can_remove_pool_transactions() {
+    let (api, handle) = spawn(NodeConfig::test()).await;
+    let provider = ethers_http_provider(&handle.http_endpoint());
+    let wallet = handle.dev_wallets().next().unwrap().to_ethers();
+    let provider = Arc::new(SignerMiddleware::new(provider, wallet.clone()));
+
+    let sender = Address::random();
+    let to = Address::random();
+    let val = 1337u64;
+
+    let tx = TransactionRequest::new().from(sender).to(to).value(val);
+
+    provider.send_transaction(tx.from(wallet.address()), None).await.unwrap();
+
+    let initial_txs = provider.txpool_inspect().await.unwrap();
+    assert_eq!(initial_txs.pending.len(), 1);
+
+    api.anvil_remove_pool_transactions(wallet.address().to_alloy()).await.unwrap();
+
+    let final_txs = provider.txpool_inspect().await.unwrap();
+    assert_eq!(final_txs.pending.len(), 0);
 }

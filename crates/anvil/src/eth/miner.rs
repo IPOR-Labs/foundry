@@ -1,7 +1,7 @@
 //! Mines transactions
 
 use crate::eth::pool::{transactions::PoolTransaction, Pool};
-use ethers::prelude::TxHash;
+use alloy_primitives::TxHash;
 use futures::{
     channel::mpsc::Receiver,
     stream::{Fuse, Stream, StreamExt},
@@ -16,9 +16,8 @@ use std::{
     time::Duration,
 };
 use tokio::time::Interval;
-use tracing::trace;
 
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct Miner {
     /// The mode this miner currently operates in
     mode: Arc<RwLock<MiningMode>>,
@@ -180,7 +179,7 @@ impl Default for FixedBlockTimeMiner {
 pub struct ReadyTransactionMiner {
     /// how many transactions to mine per block
     max_transactions: usize,
-    /// stores whether there are pending transacions (if known)
+    /// stores whether there are pending transactions (if known)
     has_pending_txs: Option<bool>,
     /// Receives hashes of transactions that are ready
     rx: Fuse<Receiver<TxHash>>,
