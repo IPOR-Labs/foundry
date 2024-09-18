@@ -3,6 +3,7 @@ use alloy_primitives::U256;
 use alloy_provider::{network::AnyNetwork, Provider};
 use alloy_transport::Transport;
 use eyre::{ContextCompat, Result};
+use foundry_common::provider::{ProviderBuilder, RetryProvider};
 use foundry_config::{Chain, Config};
 use std::{
     ffi::OsStr,
@@ -11,7 +12,6 @@ use std::{
     process::{Command, Output, Stdio},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tracing_error::ErrorLayer;
 use tracing_subscriber::prelude::*;
 
 mod cmd;
@@ -66,13 +66,12 @@ impl<T: AsRef<Path>> FoundryPathExt for T {
 }
 
 /// Initializes a tracing Subscriber for logging
-#[allow(dead_code)]
 pub fn subscriber() {
-    tracing_subscriber::Registry::default()
-        .with(tracing_subscriber::EnvFilter::from_default_env())
-        .with(ErrorLayer::default())
-        .with(tracing_subscriber::fmt::layer())
-        .init()
+    let registry = tracing_subscriber::Registry::default()
+        .with(tracing_subscriber::EnvFilter::from_default_env());
+    #[cfg(feature = "tracy")]
+    let registry = registry.with(tracing_tracy::TracyLayer::default());
+    registry.with(tracing_subscriber::fmt::layer()).init()
 }
 
 pub fn abi_to_solidity(abi: &JsonAbi, name: &str) -> Result<String> {
@@ -81,21 +80,18 @@ pub fn abi_to_solidity(abi: &JsonAbi, name: &str) -> Result<String> {
     Ok(s)
 }
 
-/// Returns a [RetryProvider](foundry_common::alloy::RetryProvider) instantiated using [Config]'s
+/// Returns a [RetryProvider] instantiated using [Config]'s
 /// RPC
-pub fn get_provider(config: &Config) -> Result<foundry_common::provider::alloy::RetryProvider> {
+pub fn get_provider(config: &Config) -> Result<RetryProvider> {
     get_provider_builder(config)?.build()
 }
 
-/// Returns a [ProviderBuilder](foundry_common::provider::alloy::ProviderBuilder) instantiated using
-/// [Config] values.
+/// Returns a [ProviderBuilder] instantiated using [Config] values.
 ///
 /// Defaults to `http://localhost:8545` and `Mainnet`.
-pub fn get_provider_builder(
-    config: &Config,
-) -> Result<foundry_common::provider::alloy::ProviderBuilder> {
+pub fn get_provider_builder(config: &Config) -> Result<ProviderBuilder> {
     let url = config.get_rpc_url_or_localhost_http()?;
-    let mut builder = foundry_common::provider::alloy::ProviderBuilder::new(url.as_ref());
+    let mut builder = ProviderBuilder::new(url.as_ref());
 
     if let Ok(chain) = config.chain.unwrap_or_default().try_into() {
         builder = builder.chain(chain);
@@ -160,7 +156,6 @@ pub fn now() -> Duration {
 }
 
 /// Runs the `future` in a new [`tokio::runtime::Runtime`]
-#[allow(unused)]
 pub fn block_on<F: Future>(future: F) -> F::Output {
     let rt = tokio::runtime::Runtime::new().expect("could not start tokio rt");
     rt.block_on(future)
@@ -196,9 +191,9 @@ pub fn load_dotenv() {
     };
 
     // we only want the .env file of the cwd and project root
-    // `find_project_root_path` calls `current_dir` internally so both paths are either both `Ok` or
+    // `find_project_root` calls `current_dir` internally so both paths are either both `Ok` or
     // both `Err`
-    if let (Ok(cwd), Ok(prj_root)) = (std::env::current_dir(), find_project_root_path(None)) {
+    if let (Ok(cwd), Ok(prj_root)) = (std::env::current_dir(), try_find_project_root(None)) {
         load(&prj_root);
         if cwd != prj_root {
             // prj root and cwd can be identical
@@ -292,7 +287,7 @@ impl<'a> Git<'a> {
 
     #[inline]
     pub fn from_config(config: &'a Config) -> Self {
-        Self::new(config.__root.0.as_path())
+        Self::new(config.root.0.as_path())
     }
 
     pub fn root_of(relative_to: &Path) -> Result<PathBuf> {
@@ -607,7 +602,7 @@ mod tests {
         assert!(!p.is_sol_test());
     }
 
-    // loads .env from cwd and project dir, See [`find_project_root_path()`]
+    // loads .env from cwd and project dir, See [`find_project_root()`]
     #[test]
     fn can_load_dotenv() {
         let temp = tempdir().unwrap();

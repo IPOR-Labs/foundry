@@ -10,9 +10,13 @@ use foundry_block_explorers::{
 use foundry_cli::{opts::EtherscanOpts, p_println, utils::Git};
 use foundry_common::{compile::ProjectCompiler, fs};
 use foundry_compilers::{
-    artifacts::{output_selection::ContractOutputSelection, Settings, StorageLayout},
-    remappings::{RelativeRemapping, Remapping},
-    ConfigurableContractArtifact, ProjectCompileOutput, ProjectPathsConfig,
+    artifacts::{
+        output_selection::ContractOutputSelection,
+        remappings::{RelativeRemapping, Remapping},
+        ConfigurableContractArtifact, Settings, StorageLayout,
+    },
+    compilers::solc::Solc,
+    ProjectCompileOutput, ProjectPathsConfig,
 };
 use foundry_config::{Chain, Config};
 use std::{
@@ -88,14 +92,8 @@ pub struct CloneArgs {
 
 impl CloneArgs {
     pub async fn run(self) -> Result<()> {
-        let CloneArgs {
-            address,
-            root,
-            opts,
-            etherscan,
-            no_remappings_txt,
-            keep_directory_structure,
-        } = self;
+        let Self { address, root, opts, etherscan, no_remappings_txt, keep_directory_structure } =
+            self;
 
         // step 0. get the chain and api key from the config
         let config = Config::from(&etherscan);
@@ -131,7 +129,7 @@ impl CloneArgs {
         if !opts.no_commit {
             let git = Git::new(&root).quiet(opts.quiet);
             git.add(Some("--all"))?;
-            let msg = format!("chore: forge clone {}", address);
+            let msg = format!("chore: forge clone {address}");
             git.commit(&msg)?;
         }
 
@@ -290,7 +288,8 @@ impl CloneArgs {
 /// It will update the following fields:
 /// - `auto_detect_solc` to `false`
 /// - `solc_version` to the value from the metadata
-/// - `evm_version` to the value from the metadata
+/// - `evm_version` to the value from the metadata, if the metadata's evm_version is "Default", then
+///   this is derived from the solc version this contract was compiled with.
 /// - `via_ir` to the value from the metadata
 /// - `libraries` to the value from the metadata
 /// - `metadata` to the value from the metadata
@@ -394,9 +393,9 @@ fn update_config_by_metadata(
     }
 
     // apply remapping on libraries
-    let path_config = config.project_paths();
+    let path_config: ProjectPathsConfig = config.project_paths();
     let libraries = libraries
-        .with_applied_remappings(&path_config)
+        .apply(|libs| path_config.apply_lib_remappings(libs))
         .with_stripped_file_prefixes(&path_config.root);
 
     // update libraries
@@ -417,7 +416,7 @@ fn update_config_by_metadata(
 /// A list of remappings is returned
 fn dump_sources(meta: &Metadata, root: &PathBuf, no_reorg: bool) -> Result<Vec<RelativeRemapping>> {
     // get config
-    let path_config = ProjectPathsConfig::builder().build_with_root(root);
+    let path_config = ProjectPathsConfig::builder().build_with_root::<Solc>(root);
     // we will canonicalize the sources directory later
     let src_dir = &path_config.sources;
     let lib_dir = &path_config.libraries[0];
@@ -470,7 +469,7 @@ fn dump_sources(meta: &Metadata, root: &PathBuf, no_reorg: bool) -> Result<Vec<R
                 let new_dir = if folder_name == "lib" { lib_dir } else { src_dir };
                 for e in read_dir(entry.path())? {
                     let e = e?;
-                    let dest = new_dir.join(&e.file_name());
+                    let dest = new_dir.join(e.file_name());
                     eyre::ensure!(!Path::exists(&dest), "destination already exists: {:?}", dest);
                     std::fs::rename(e.path(), &dest)?;
                     remappings.push(Remapping {
@@ -547,7 +546,7 @@ fn dump_sources(meta: &Metadata, root: &PathBuf, no_reorg: bool) -> Result<Vec<R
 }
 
 /// Compile the project in the root directory, and return the compilation result.
-pub fn compile_project(root: &PathBuf, quiet: bool) -> Result<ProjectCompileOutput> {
+pub fn compile_project(root: &Path, quiet: bool) -> Result<ProjectCompileOutput> {
     let mut config = Config::load_with_root(root).sanitized();
     config.extra_output.push(ContractOutputSelection::StorageLayout);
     let project = config.project()?;
@@ -573,14 +572,12 @@ pub fn find_main_contract<'a>(
             rv = Some((PathBuf::from(f), a));
         }
     }
-    rv.ok_or(eyre::eyre!("contract not found"))
+    rv.ok_or_else(|| eyre::eyre!("contract not found"))
 }
 
-#[cfg(test)]
-use mockall::automock;
 /// EtherscanClient is a trait that defines the methods to interact with Etherscan.
 /// It is defined as a wrapper of the `foundry_block_explorers::Client` to allow mocking.
-#[cfg_attr(test, automock)]
+#[cfg_attr(test, mockall::automock)]
 pub(crate) trait EtherscanClient {
     async fn contract_source_code(
         &self,
@@ -613,13 +610,13 @@ impl EtherscanClient for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy_primitives::hex;
     use foundry_compilers::Artifact;
-    use foundry_test_utils::rpc::next_etherscan_api_key;
-    use hex::ToHex;
+    use foundry_test_utils::rpc::next_mainnet_etherscan_api_key;
     use std::collections::BTreeMap;
 
     fn assert_successful_compilation(root: &PathBuf) -> ProjectCompileOutput {
-        println!("project_root: {:#?}", root);
+        println!("project_root: {root:#?}");
         compile_project(root, false).expect("compilation failure")
     }
 
@@ -633,9 +630,9 @@ mod tests {
                 if name == contract_name {
                     let compiled_creation_code =
                         contract.get_bytecode_object().expect("creation code not found");
-                    let compiled_creation_code: String = compiled_creation_code.encode_hex();
                     assert!(
-                        compiled_creation_code.starts_with(stripped_creation_code),
+                        hex::encode(compiled_creation_code.as_ref())
+                            .starts_with(stripped_creation_code),
                         "inconsistent creation code"
                     );
                 }
@@ -693,7 +690,7 @@ mod tests {
         // create folder if not exists
         std::fs::create_dir_all(&data_folder).unwrap();
         // create metadata.json and creation_data.json
-        let client = Client::new(Chain::mainnet(), next_etherscan_api_key()).unwrap();
+        let client = Client::new(Chain::mainnet(), next_mainnet_etherscan_api_key()).unwrap();
         let meta = client.contract_source_code(address).await.unwrap();
         // dump json
         let json = serde_json::to_string_pretty(&meta).unwrap();

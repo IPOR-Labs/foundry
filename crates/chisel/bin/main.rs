@@ -94,15 +94,16 @@ pub enum ChiselSubcommand {
     ClearCache,
 }
 
-#[tokio::main]
-async fn main() -> eyre::Result<()> {
+fn main() -> eyre::Result<()> {
     handler::install();
     utils::subscriber();
     utils::load_dotenv();
-
-    // Parse command args
     let args = Chisel::parse();
+    main_args(args)
+}
 
+#[tokio::main]
+async fn main_args(args: Chisel) -> eyre::Result<()> {
     // Keeps track of whether or not an interrupt was the last input
     let mut interrupt = false;
 
@@ -272,10 +273,11 @@ async fn evaluate_prelude(
         load_prelude_file(dispatcher, prelude_dir).await?;
         println!("{}\n", "Prelude source file loaded successfully!".green());
     } else {
-        let prelude_sources = fs::files_with_ext(prelude_dir, "sol");
-        let print_success_msg = !prelude_sources.is_empty();
+        let prelude_sources = fs::files_with_ext(&prelude_dir, "sol");
+        let mut print_success_msg = false;
         for source_file in prelude_sources {
-            println!("{} {}", "Loading prelude source file:".yellow(), source_file.display(),);
+            print_success_msg = true;
+            println!("{} {}", "Loading prelude source file:".yellow(), source_file.display());
             load_prelude_file(dispatcher, source_file).await?;
         }
 

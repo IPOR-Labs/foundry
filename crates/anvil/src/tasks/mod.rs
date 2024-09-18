@@ -1,12 +1,13 @@
 //! Task management support
 
+#![allow(rustdoc::private_doc_tests)]
+
 use crate::{shutdown::Shutdown, tasks::block_listener::BlockListener, EthApi};
 use alloy_network::AnyNetwork;
 use alloy_primitives::B256;
 use alloy_provider::Provider;
-use alloy_rpc_types::Block;
+use alloy_rpc_types::{anvil::Forking, AnyNetworkBlock};
 use alloy_transport::Transport;
-use anvil_core::types::Forking;
 use futures::StreamExt;
 use std::{fmt, future::Future};
 use tokio::{runtime::Handle, task::JoinHandle};
@@ -21,8 +22,6 @@ pub struct TaskManager {
     /// A receiver for the shutdown signal
     on_shutdown: Shutdown,
 }
-
-// === impl TaskManager ===
 
 impl TaskManager {
     /// Creates a new instance of the task manager
@@ -74,11 +73,11 @@ impl TaskManager {
             let provider = provider.clone();
             let api = api.clone();
             async move {
-                if let Ok(Some(block)) = provider.get_block(hash.into(), false).await {
+                if let Ok(Some(block)) = provider.get_block(hash.into(), false.into()).await {
                     let _ = api
                         .anvil_reset(Some(Forking {
                             json_rpc_url: None,
-                            block_number: block.header.number,
+                            block_number: Some(block.header.number),
                         }))
                         .await;
                 }
@@ -136,7 +135,7 @@ impl TaskManager {
                 let _ = api
                     .anvil_reset(Some(Forking {
                         json_rpc_url: None,
-                        block_number: block.header.number,
+                        block_number: Some(block.header.number),
                     }))
                     .await;
             }
@@ -150,7 +149,7 @@ impl TaskManager {
     where
         P: Provider<T, AnyNetwork> + 'static,
         T: Transport + Clone,
-        F: Fn(Block) -> Fut + Unpin + Send + Sync + 'static,
+        F: Fn(AnyNetworkBlock) -> Fut + Unpin + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send,
     {
         let shutdown = self.on_shutdown.clone();

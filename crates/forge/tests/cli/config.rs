@@ -2,7 +2,10 @@
 
 use alloy_primitives::{Address, B256, U256};
 use foundry_cli::utils as forge_utils;
-use foundry_compilers::artifacts::{BytecodeHash, OptimizerDetails, RevertStrings, YulDetails};
+use foundry_compilers::{
+    artifacts::{BytecodeHash, OptimizerDetails, RevertStrings, YulDetails},
+    solc::Solc,
+};
 use foundry_config::{
     cache::{CachedChains, CachedEndpoints, StorageCachingConfig},
     fs_permissions::{FsAccessPermission, PathPermission},
@@ -10,11 +13,11 @@ use foundry_config::{
 };
 use foundry_evm::opts::EvmOpts;
 use foundry_test_utils::{
-    foundry_compilers::{remappings::Remapping, EvmVersion},
+    foundry_compilers::artifacts::{remappings::Remapping, EvmVersion},
     util::{pretty_err, OutputExt, TestCommand, OTHER_SOLC_VERSION},
 };
 use path_slash::PathBufExt;
-use pretty_assertions::assert_eq;
+use similar_asserts::assert_eq;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -26,7 +29,7 @@ forgetest!(can_extract_config_values, |prj, cmd| {
     // explicitly set all values
     let input = Config {
         profile: Config::DEFAULT_PROFILE,
-        __root: Default::default(),
+        root: Default::default(),
         src: "test-src".into(),
         test: "test-test".into(),
         script: "test-script".into(),
@@ -61,15 +64,24 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         contract_pattern_inverse: None,
         path_pattern: None,
         path_pattern_inverse: None,
+        coverage_pattern_inverse: None,
+        test_failures_file: "test-cache/test-failures".into(),
+        threads: None,
+        show_progress: false,
         fuzz: FuzzConfig {
             runs: 1000,
             max_test_rejects: 100203,
             seed: Some(U256::from(1000)),
             failure_persist_dir: Some("test-cache/fuzz".into()),
             failure_persist_file: Some("failures".to_string()),
+            show_logs: false,
             ..Default::default()
         },
-        invariant: InvariantConfig { runs: 256, ..Default::default() },
+        invariant: InvariantConfig {
+            runs: 256,
+            failure_persist_dir: Some("test-cache/fuzz".into()),
+            ..Default::default()
+        },
         ffi: true,
         always_use_create_2_factory: false,
         prompt_timeout: 0,
@@ -95,7 +107,7 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         etherscan_api_key: None,
         etherscan: Default::default(),
         verbosity: 4,
-        remappings: vec![Remapping::from_str("forge-std=lib/forge-std/").unwrap().into()],
+        remappings: vec![Remapping::from_str("forge-std/=lib/forge-std/").unwrap().into()],
         libraries: vec![
             "src/DssSpell.sol:DssExecLib:0x8De6DDbCd5053d32292AAA0D2105A32d108484a6".to_string()
         ],
@@ -122,25 +134,36 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         build_info_path: None,
         fmt: Default::default(),
         doc: Default::default(),
+        bind_json: Default::default(),
         fs_permissions: Default::default(),
         labels: Default::default(),
-        cancun: true,
         isolate: true,
         unchecked_cheatcode_artifacts: false,
-        __non_exhaustive: (),
-        __warnings: vec![],
+        create2_library_salt: Config::DEFAULT_CREATE2_LIBRARY_SALT,
+        vyper: Default::default(),
+        skip: vec![],
+        dependencies: Default::default(),
+        soldeer: Default::default(),
+        warnings: vec![],
+        assertions_revert: true,
+        legacy_assertions: false,
+        extra_args: vec![],
+        eof_version: None,
+        alphanet: false,
+        transaction_timeout: 120,
+        _non_exhaustive: (),
     };
     prj.write_config(input.clone());
     let config = cmd.config();
-    pretty_assertions::assert_eq!(input, config);
+    similar_asserts::assert_eq!(input, config);
 });
 
 // tests config gets printed to std out
 forgetest!(can_show_config, |prj, cmd| {
-    cmd.arg("config");
     let expected =
         Config::load_with_root(prj.root()).to_string_pretty().unwrap().trim().to_string();
-    assert_eq!(expected, cmd.stdout_lossy().trim().to_string());
+    let output = cmd.arg("config").assert_success().get_output().stdout_lossy().trim().to_string();
+    assert_eq!(expected, output);
 });
 
 // checks that config works
@@ -165,14 +188,14 @@ forgetest_init!(can_override_config, |prj, cmd| {
         Remapping::from(profile.remappings[0].clone()).to_string()
     );
 
-    cmd.arg("config");
-    let expected = profile.to_string_pretty().unwrap();
-    assert_eq!(expected.trim().to_string(), cmd.stdout_lossy().trim().to_string());
+    let expected = profile.to_string_pretty().unwrap().trim().to_string();
+    let output = cmd.arg("config").assert_success().get_output().stdout_lossy().trim().to_string();
+    assert_eq!(expected, output);
 
     // remappings work
     let remappings_txt =
         prj.create_file("remappings.txt", "ds-test/=lib/forge-std/lib/ds-test/from-file/");
-    let config = forge_utils::load_config_with_root(Some(prj.root().into()));
+    let config = forge_utils::load_config_with_root(Some(prj.root()));
     assert_eq!(
         format!(
             "ds-test/={}/",
@@ -183,7 +206,7 @@ forgetest_init!(can_override_config, |prj, cmd| {
 
     // env vars work
     std::env::set_var("DAPP_REMAPPINGS", "ds-test/=lib/forge-std/lib/ds-test/from-env/");
-    let config = forge_utils::load_config_with_root(Some(prj.root().into()));
+    let config = forge_utils::load_config_with_root(Some(prj.root()));
     assert_eq!(
         format!(
             "ds-test/={}/",
@@ -213,9 +236,16 @@ forgetest_init!(can_override_config, |prj, cmd| {
     std::env::remove_var("DAPP_REMAPPINGS");
     pretty_err(&remappings_txt, fs::remove_file(&remappings_txt));
 
-    cmd.set_cmd(prj.forge_bin()).args(["config", "--basic"]);
-    let expected = profile.into_basic().to_string_pretty().unwrap();
-    assert_eq!(expected.trim().to_string(), cmd.stdout_lossy().trim().to_string());
+    let expected = profile.into_basic().to_string_pretty().unwrap().trim().to_string();
+    let output = cmd
+        .forge_fuse()
+        .args(["config", "--basic"])
+        .assert_success()
+        .get_output()
+        .stdout_lossy()
+        .trim()
+        .to_string();
+    assert_eq!(expected, output);
 });
 
 forgetest_init!(can_parse_remappings_correctly, |prj, cmd| {
@@ -232,13 +262,18 @@ forgetest_init!(can_parse_remappings_correctly, |prj, cmd| {
     // the loaded config has resolved, absolute paths
     assert_eq!("forge-std/=lib/forge-std/src/", Remapping::from(r.clone()).to_string());
 
-    cmd.arg("config");
-    let expected = profile.to_string_pretty().unwrap();
-    assert_eq!(expected.trim().to_string(), cmd.stdout_lossy().trim().to_string());
+    let expected = profile.to_string_pretty().unwrap().trim().to_string();
+    let output = cmd.arg("config").assert_success().get_output().stdout_lossy().trim().to_string();
+    assert_eq!(expected, output);
 
     let install = |cmd: &mut TestCommand, dep: &str| {
-        cmd.forge_fuse().args(["install", dep, "--no-commit"]);
-        cmd.assert_non_empty_stdout();
+        cmd.forge_fuse().args(["install", dep, "--no-commit"]).assert_success().stdout_eq(str![[
+            r#"
+Installing solmate in [..] (url: Some("https://github.com/transmissions11/solmate"), tag: None)
+    Installed solmate
+
+"#
+        ]]);
     };
 
     install(&mut cmd, "transmissions11/solmate");
@@ -248,7 +283,7 @@ forgetest_init!(can_parse_remappings_correctly, |prj, cmd| {
         "remappings.txt",
         "solmate/=lib/solmate/src/\nsolmate-contracts/=lib/solmate/src/",
     );
-    let config = forge_utils::load_config_with_root(Some(prj.root().into()));
+    let config = forge_utils::load_config_with_root(Some(prj.root()));
     // trailing slashes are removed on windows `to_slash_lossy`
     let path = prj.root().join("lib/solmate/src/").to_slash_lossy().into_owned();
     #[cfg(windows)]
@@ -265,9 +300,16 @@ forgetest_init!(can_parse_remappings_correctly, |prj, cmd| {
     );
     pretty_err(&remappings_txt, fs::remove_file(&remappings_txt));
 
-    cmd.set_cmd(prj.forge_bin()).args(["config", "--basic"]);
-    let expected = profile.into_basic().to_string_pretty().unwrap();
-    assert_eq!(expected.trim().to_string(), cmd.stdout_lossy().trim().to_string());
+    let expected = profile.into_basic().to_string_pretty().unwrap().trim().to_string();
+    let output = cmd
+        .forge_fuse()
+        .args(["config", "--basic"])
+        .assert_success()
+        .get_output()
+        .stdout_lossy()
+        .trim()
+        .to_string();
+    assert_eq!(expected, output);
 });
 
 forgetest_init!(can_detect_config_vals, |prj, _cmd| {
@@ -325,9 +367,12 @@ contract Greeter {}
     let config = Config { solc: Some(OTHER_SOLC_VERSION.into()), ..Default::default() };
     prj.write_config(config);
 
-    cmd.arg("build");
+    cmd.arg("build").assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
 
-    assert!(cmd.stdout_lossy().contains("Compiler run successful!"));
+"#]]);
 });
 
 // tests that `--use <solc>` works
@@ -341,27 +386,45 @@ contract Foo {}
     )
     .unwrap();
 
-    cmd.args(["build", "--use", OTHER_SOLC_VERSION]);
-    let stdout = cmd.stdout_lossy();
-    assert!(stdout.contains("Compiler run successful"));
+    cmd.args(["build", "--use", OTHER_SOLC_VERSION]).assert_success().stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+"#]]);
 
     cmd.forge_fuse()
         .args(["build", "--force", "--use", &format!("solc:{OTHER_SOLC_VERSION}")])
-        .root_arg();
-    let stdout = cmd.stdout_lossy();
-    assert!(stdout.contains("Compiler run successful"));
+        .root_arg()
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+"#]]);
 
     // fails to use solc that does not exist
     cmd.forge_fuse().args(["build", "--use", "this/solc/does/not/exist"]);
-    assert!(cmd.stderr_lossy().contains("this/solc/does/not/exist does not exist"));
+    cmd.assert_failure().stderr_eq(str![[r#"
+Error: 
+`solc` this/solc/does/not/exist does not exist
+
+"#]]);
 
     // `OTHER_SOLC_VERSION` was installed in previous step, so we can use the path to this directly
-    let local_solc = foundry_compilers::Solc::find_svm_installed_version(OTHER_SOLC_VERSION)
-        .unwrap()
-        .expect("solc is installed");
-    cmd.forge_fuse().args(["build", "--force", "--use"]).arg(local_solc.solc).root_arg();
-    let stdout = cmd.stdout_lossy();
-    assert!(stdout.contains("Compiler run successful"));
+    let local_solc = Solc::find_or_install(&OTHER_SOLC_VERSION.parse().unwrap()).unwrap();
+    cmd.forge_fuse()
+        .args(["build", "--force", "--use"])
+        .arg(local_solc.solc)
+        .root_arg()
+        .assert_success()
+        .stdout_eq(str![[r#"
+[COMPILING_FILES] with [SOLC_VERSION]
+[SOLC_VERSION] [ELAPSED]
+Compiler run successful!
+
+"#]]);
 });
 
 // test to ensure yul optimizer can be set as intended
@@ -380,11 +443,17 @@ contract Foo {
     )
     .unwrap();
 
-    cmd.arg("build");
-    cmd.unchecked_output().stderr_matches_path(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/can_set_yul_optimizer.stderr"),
-    );
+    cmd.arg("build").assert_failure().stderr_eq(str![[r#"
+Error: 
+Compiler run failed:
+Error (6553): The msize instruction cannot be used when the Yul optimizer is activated because it can change its semantics. Either disable the Yul optimizer or do not use the instruction.
+ [FILE]:6:8:
+  |
+6 |        assembly {
+  |        ^ (Relevant source part starts here and spans across multiple lines).
+
+
+"#]]);
 
     // disable yul optimizer explicitly
     let config = Config {
@@ -436,10 +505,10 @@ forgetest!(can_set_gas_price, |prj, cmd| {
 
 // test that we can detect remappings from foundry.toml
 forgetest_init!(can_detect_lib_foundry_toml, |prj, cmd| {
+    std::env::remove_var("DAPP_REMAPPINGS");
     let config = cmd.config();
     let remappings = config.remappings.iter().cloned().map(Remapping::from).collect::<Vec<_>>();
-    dbg!(&remappings);
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         remappings,
         vec![
             // global
@@ -457,7 +526,7 @@ forgetest_init!(can_detect_lib_foundry_toml, |prj, cmd| {
 
     let config = cmd.config();
     let remappings = config.remappings.iter().cloned().map(Remapping::from).collect::<Vec<_>>();
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         remappings,
         vec![
             // default
@@ -477,10 +546,11 @@ forgetest_init!(can_detect_lib_foundry_toml, |prj, cmd| {
     let toml_file = nested.join("foundry.toml");
     pretty_err(&toml_file, fs::write(&toml_file, config.to_string_pretty().unwrap()));
 
+    std::env::remove_var("DAPP_REMAPPINGS");
     let another_config = cmd.config();
     let remappings =
         another_config.remappings.iter().cloned().map(Remapping::from).collect::<Vec<_>>();
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         remappings,
         vec![
             // local to the lib
@@ -496,9 +566,10 @@ forgetest_init!(can_detect_lib_foundry_toml, |prj, cmd| {
 
     config.src = "custom-source-dir".into();
     pretty_err(&toml_file, fs::write(&toml_file, config.to_string_pretty().unwrap()));
+    std::env::remove_var("DAPP_REMAPPINGS");
     let config = cmd.config();
     let remappings = config.remappings.iter().cloned().map(Remapping::from).collect::<Vec<_>>();
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         remappings,
         vec![
             // local to the lib
@@ -528,7 +599,7 @@ forgetest_init!(can_prioritise_closer_lib_remappings, |prj, cmd| {
 
     let config = cmd.config();
     let remappings = config.get_all_remappings().collect::<Vec<_>>();
-    pretty_assertions::assert_eq!(
+    similar_asserts::assert_eq!(
         remappings,
         vec![
             "dep1/=lib/dep1/src/".parse().unwrap(),
@@ -545,8 +616,13 @@ forgetest!(can_update_libs_section, |prj, cmd| {
     let init = Config { libs: vec!["node_modules".into()], ..Default::default() };
     prj.write_config(init);
 
-    cmd.args(["install", "foundry-rs/forge-std", "--no-commit"]);
-    cmd.assert_non_empty_stdout();
+    cmd.args(["install", "foundry-rs/forge-std", "--no-commit"]).assert_success().stdout_eq(str![
+        [r#"
+Installing forge-std in [..] (url: Some("https://github.com/foundry-rs/forge-std"), tag: None)
+    Installed forge-std [..]
+
+"#]
+    ]);
 
     let config = cmd.forge_fuse().config();
     // `lib` was added automatically
@@ -554,8 +630,14 @@ forgetest!(can_update_libs_section, |prj, cmd| {
     assert_eq!(config.libs, expected);
 
     // additional install don't edit `libs`
-    cmd.forge_fuse().args(["install", "dapphub/ds-test", "--no-commit"]);
-    cmd.assert_non_empty_stdout();
+    cmd.forge_fuse()
+        .args(["install", "dapphub/ds-test", "--no-commit"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+Installing ds-test in [..] (url: Some("https://github.com/dapphub/ds-test"), tag: None)
+    Installed ds-test
+
+"#]]);
 
     let config = cmd.forge_fuse().config();
     assert_eq!(config.libs, expected);
@@ -566,8 +648,13 @@ forgetest!(can_update_libs_section, |prj, cmd| {
 forgetest!(config_emit_warnings, |prj, cmd| {
     cmd.git_init();
 
-    cmd.args(["install", "foundry-rs/forge-std", "--no-commit"]);
-    cmd.assert_non_empty_stdout();
+    cmd.args(["install", "foundry-rs/forge-std", "--no-commit"]).assert_success().stdout_eq(str![
+        [r#"
+Installing forge-std in [..] (url: Some("https://github.com/foundry-rs/forge-std"), tag: None)
+    Installed forge-std [..]
+
+"#]
+    ]);
 
     let faulty_toml = r"[default]
     src = 'src'
@@ -577,16 +664,12 @@ forgetest!(config_emit_warnings, |prj, cmd| {
     fs::write(prj.root().join("foundry.toml"), faulty_toml).unwrap();
     fs::write(prj.root().join("lib").join("forge-std").join("foundry.toml"), faulty_toml).unwrap();
 
-    cmd.forge_fuse().args(["config"]);
-    let output = cmd.execute();
-    assert!(output.status.success());
-    assert_eq!(
-        String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .filter(|line| line.contains("unknown config section") && line.contains("[default]"))
-            .count(),
-        1,
-    );
+    cmd.forge_fuse().args(["config"]).assert_success().stderr_eq(str![[r#"
+warning: Found unknown config section in foundry.toml: [default]
+This notation for profiles has been deprecated and may result in the profile not being registered in future versions.
+Please use [profile.default] instead or run `forge config --fix`.
+
+"#]]);
 });
 
 forgetest_init!(can_skip_remappings_auto_detection, |prj, cmd| {
@@ -609,7 +692,8 @@ forgetest_init!(can_parse_default_fs_permissions, |_prj, cmd| {
     let config = cmd.config();
 
     assert_eq!(config.fs_permissions.len(), 1);
-    let out_permission = config.fs_permissions.find_permission(Path::new("out")).unwrap();
+    let permissions = config.fs_permissions.joined(Path::new("test"));
+    let out_permission = permissions.find_permission(Path::new("test/out")).unwrap();
     assert_eq!(FsAccessPermission::Read, out_permission);
 });
 
@@ -679,8 +763,11 @@ forgetest_init!(can_resolve_symlink_fs_permissions, |prj, cmd| {
 
 // tests if evm version is normalized for config output
 forgetest!(normalize_config_evm_version, |_prj, cmd| {
-    cmd.args(["config", "--use", "0.8.0", "--json"]);
-    let output = cmd.stdout_lossy();
+    let output = cmd
+        .args(["config", "--use", "0.8.0", "--json"])
+        .assert_success()
+        .get_output()
+        .stdout_lossy();
     let config: Config = serde_json::from_str(&output).unwrap();
     assert_eq!(config.evm_version, EvmVersion::Istanbul);
 });

@@ -1,8 +1,12 @@
+#![doc = include_str!("../README.md")]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+
 use alloy_consensus::TxEnvelope;
 use alloy_dyn_abi::{DynSolType, DynSolValue, FunctionExt};
-use alloy_json_abi::{ContractObject, Function};
+use alloy_json_abi::Function;
 use alloy_network::AnyNetwork;
 use alloy_primitives::{
+    hex,
     utils::{keccak256, ParseUnits, Unit},
     Address, Keccak256, TxHash, TxKind, B256, I256, U256,
 };
@@ -11,7 +15,8 @@ use alloy_provider::{
     PendingTransactionBuilder, Provider,
 };
 use alloy_rlp::Decodable;
-use alloy_rpc_types::{BlockId, BlockNumberOrTag, Filter, TransactionRequest, WithOtherFields};
+use alloy_rpc_types::{BlockId, BlockNumberOrTag, Filter, TransactionRequest};
+use alloy_serde::WithOtherFields;
 use alloy_sol_types::sol;
 use alloy_transport::Transport;
 use base::{Base, NumberWithBase, ToBase};
@@ -21,12 +26,15 @@ use eyre::{Context, ContextCompat, Result};
 use foundry_block_explorers::Client;
 use foundry_common::{
     abi::{encode_function_args, get_func},
+    compile::etherscan_project,
     fmt::*,
-    TransactionReceiptWithRevertReason,
+    fs, get_pretty_tx_receipt_attr, TransactionReceiptWithRevertReason,
 };
+use foundry_compilers::flatten::Flattener;
 use foundry_config::Chain;
 use futures::{future::Either, FutureExt, StreamExt};
 use rayon::prelude::*;
+use revm::primitives::Eof;
 use std::{
     borrow::Cow,
     io,
@@ -34,6 +42,7 @@ use std::{
     path::PathBuf,
     str::FromStr,
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
 use tokio::signal::ctrl_c;
 
@@ -91,7 +100,8 @@ where
     ///
     /// ```
     /// use alloy_primitives::{Address, U256, Bytes};
-    /// use alloy_rpc_types::{TransactionRequest, WithOtherFields};
+    /// use alloy_rpc_types::{TransactionRequest};
+    /// use alloy_serde::WithOtherFields;
     /// use cast::Cast;
     /// use alloy_provider::{RootProvider, ProviderBuilder, network::AnyNetwork};
     /// use std::str::FromStr;
@@ -109,7 +119,7 @@ where
     /// let tx = TransactionRequest::default().to(to).input(bytes.into());
     /// let tx = WithOtherFields::new(tx);
     /// let cast = Cast::new(alloy_provider);
-    /// let data = cast.call(&tx, None, None).await?;
+    /// let data = cast.call(&tx, None, None, false).await?;
     /// println!("{}", data);
     /// # Ok(())
     /// # }
@@ -119,8 +129,9 @@ where
         req: &WithOtherFields<TransactionRequest>,
         func: Option<&Function>,
         block: Option<BlockId>,
+        json: bool,
     ) -> Result<String> {
-        let res = self.provider.call(req, block.unwrap_or(BlockId::latest())).await?;
+        let res = self.provider.call(req).block(block.unwrap_or_default()).await?;
 
         let mut decoded = vec![];
 
@@ -133,8 +144,11 @@ where
                     if res.is_empty() {
                         // check that the recipient is a contract that can be called
                         if let Some(TxKind::Call(addr)) = req.to {
-                            if let Ok(code) =
-                                self.provider.get_code_at(addr, block.unwrap_or_default()).await
+                            if let Ok(code) = self
+                                .provider
+                                .get_code_at(addr)
+                                .block_id(block.unwrap_or_default())
+                                .await
                             {
                                 if code.is_empty() {
                                     eyre::bail!("contract {addr:?} does not have any code")
@@ -155,7 +169,10 @@ where
 
         // handle case when return type is not specified
         Ok(if decoded.is_empty() {
-            format!("{res}\n")
+            res.to_string()
+        } else if json {
+            let tokens = decoded.iter().map(format_token_raw).collect::<Vec<_>>();
+            serde_json::to_string_pretty(&tokens).unwrap()
         } else {
             // seth compatible user-friendly return type conversions
             decoded.iter().map(format_token).collect::<Vec<_>>().join("\n")
@@ -169,7 +186,8 @@ where
     /// ```
     /// use cast::{Cast};
     /// use alloy_primitives::{Address, U256, Bytes};
-    /// use alloy_rpc_types::{TransactionRequest, WithOtherFields};
+    /// use alloy_rpc_types::{TransactionRequest};
+    /// use alloy_serde::WithOtherFields;
     /// use alloy_provider::{RootProvider, ProviderBuilder, network::AnyNetwork};
     /// use std::str::FromStr;
     /// use alloy_sol_types::{sol, SolCall};
@@ -198,7 +216,7 @@ where
         to_json: bool,
     ) -> Result<String> {
         let access_list =
-            self.provider.create_access_list(req, block.unwrap_or(BlockId::latest())).await?;
+            self.provider.create_access_list(req).block_id(block.unwrap_or_default()).await?;
         let res = if to_json {
             serde_json::to_string(&access_list)?
         } else {
@@ -220,7 +238,7 @@ where
     }
 
     pub async fn balance(&self, who: Address, block: Option<BlockId>) -> Result<U256> {
-        Ok(self.provider.get_balance(who, block.unwrap_or(BlockId::latest())).await?)
+        Ok(self.provider.get_balance(who).block_id(block.unwrap_or_default()).await?)
     }
 
     /// Sends a transaction to the specified address
@@ -230,7 +248,8 @@ where
     /// ```
     /// use cast::{Cast};
     /// use alloy_primitives::{Address, U256, Bytes};
-    /// use alloy_rpc_types::{TransactionRequest, WithOtherFields};
+    /// use alloy_serde::WithOtherFields;
+    /// use alloy_rpc_types::{TransactionRequest};
     /// use alloy_provider::{RootProvider, ProviderBuilder, network::AnyNetwork};
     /// use std::str::FromStr;
     /// use alloy_sol_types::{sol, SolCall};
@@ -285,7 +304,7 @@ where
     pub async fn publish(
         &self,
         mut raw_tx: String,
-    ) -> Result<PendingTransactionBuilder<T, AnyNetwork>> {
+    ) -> Result<PendingTransactionBuilder<'_, T, AnyNetwork>> {
         raw_tx = match raw_tx.strip_prefix("0x") {
             Some(s) => s.to_string(),
             None => raw_tx,
@@ -327,7 +346,7 @@ where
 
         let block = self
             .provider
-            .get_block(block, full)
+            .get_block(block, full.into())
             .await?
             .ok_or_else(|| eyre::eyre!("block {:?} not found", block))?;
 
@@ -345,7 +364,7 @@ where
 
     async fn block_field_as_num<B: Into<BlockId>>(&self, block: B, field: String) -> Result<U256> {
         let block = block.into();
-        let block_field = Cast::block(
+        let block_field = Self::block(
             self,
             block,
             false,
@@ -364,22 +383,22 @@ where
     }
 
     pub async fn base_fee<B: Into<BlockId>>(&self, block: B) -> Result<U256> {
-        Cast::block_field_as_num(self, block, String::from("baseFeePerGas")).await
+        Self::block_field_as_num(self, block, String::from("baseFeePerGas")).await
     }
 
     pub async fn age<B: Into<BlockId>>(&self, block: B) -> Result<String> {
         let timestamp_str =
-            Cast::block_field_as_num(self, block, String::from("timestamp")).await?.to_string();
+            Self::block_field_as_num(self, block, String::from("timestamp")).await?.to_string();
         let datetime = DateTime::from_timestamp(timestamp_str.parse::<i64>().unwrap(), 0).unwrap();
         Ok(datetime.format("%a %b %e %H:%M:%S %Y").to_string())
     }
 
     pub async fn timestamp<B: Into<BlockId>>(&self, block: B) -> Result<U256> {
-        Cast::block_field_as_num(self, block, "timestamp".to_string()).await
+        Self::block_field_as_num(self, block, "timestamp".to_string()).await
     }
 
     pub async fn chain(&self) -> Result<&str> {
-        let genesis_hash = Cast::block(
+        let genesis_hash = Self::block(
             self,
             0,
             false,
@@ -391,7 +410,7 @@ where
 
         Ok(match &genesis_hash[..] {
             "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3" => {
-                match &(Cast::block(self, 1920000, false, Some("hash".to_string()), false).await?)[..]
+                match &(Self::block(self, 1920000, false, Some("hash".to_string()), false).await?)[..]
                 {
                     "0x94365e3a8c0b35089c1d1195081fe7489b528a84b22199c916180db8b28ade7f" => {
                         "etclive"
@@ -430,7 +449,7 @@ where
             "0x6d3c66c5357ec91d5c43af47e234a939b22557cbb552dc45bebbceeed90fbe34" => "bsctest",
             "0x0d21840abff46b96c84b2ac9e10e4f5cdaeb5693cb665db62a2f3b02d2d57b5b" => "bsc",
             "0x31ced5b9beb7f8782b014660da0cb18cc409f121f408186886e1ca3e8eeca96b" => {
-                match &(Cast::block(self, 1, false, Some(String::from("hash")), false).await?)[..] {
+                match &(Self::block(self, 1, false, Some(String::from("hash")), false).await?)[..] {
                     "0x738639479dc82d199365626f90caa82f7eafcfe9ed354b456fb3d294597ceb53" => {
                         "avalanche-fuji"
                     }
@@ -472,7 +491,73 @@ where
     /// # }
     /// ```
     pub async fn nonce(&self, who: Address, block: Option<BlockId>) -> Result<u64> {
-        Ok(self.provider.get_transaction_count(who, block.unwrap_or(BlockId::latest())).await?)
+        Ok(self.provider.get_transaction_count(who).block_id(block.unwrap_or_default()).await?)
+    }
+
+    /// #Example
+    ///
+    /// ```
+    /// use alloy_primitives::{Address, FixedBytes};
+    /// use alloy_provider::{network::AnyNetwork, ProviderBuilder, RootProvider};
+    /// use cast::Cast;
+    /// use std::str::FromStr;
+    ///
+    /// # async fn foo() -> eyre::Result<()> {
+    /// let provider =
+    ///     ProviderBuilder::<_, _, AnyNetwork>::default().on_builtin("http://localhost:8545").await?;
+    /// let cast = Cast::new(provider);
+    /// let addr = Address::from_str("0x7eD52863829AB99354F3a0503A622e82AcD5F7d3")?;
+    /// let slots = vec![FixedBytes::from_str("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")?];
+    /// let codehash = cast.codehash(addr, slots, None).await?;
+    /// println!("{}", codehash);
+    /// # Ok(())
+    /// # }
+    pub async fn codehash(
+        &self,
+        who: Address,
+        slots: Vec<B256>,
+        block: Option<BlockId>,
+    ) -> Result<String> {
+        Ok(self
+            .provider
+            .get_proof(who, slots)
+            .block_id(block.unwrap_or_default())
+            .await?
+            .code_hash
+            .to_string())
+    }
+
+    /// #Example
+    ///
+    /// ```
+    /// use alloy_primitives::{Address, FixedBytes};
+    /// use alloy_provider::{network::AnyNetwork, ProviderBuilder, RootProvider};
+    /// use cast::Cast;
+    /// use std::str::FromStr;
+    ///
+    /// # async fn foo() -> eyre::Result<()> {
+    /// let provider =
+    ///     ProviderBuilder::<_, _, AnyNetwork>::default().on_builtin("http://localhost:8545").await?;
+    /// let cast = Cast::new(provider);
+    /// let addr = Address::from_str("0x7eD52863829AB99354F3a0503A622e82AcD5F7d3")?;
+    /// let slots = vec![FixedBytes::from_str("0x56e81f171bcc55a6ff8345e692c0f86e5b48e01b996cadc001622fb5e363b421")?];
+    /// let storage_root = cast.storage_root(addr, slots, None).await?;
+    /// println!("{}", storage_root);
+    /// # Ok(())
+    /// # }
+    pub async fn storage_root(
+        &self,
+        who: Address,
+        slots: Vec<B256>,
+        block: Option<BlockId>,
+    ) -> Result<String> {
+        Ok(self
+            .provider
+            .get_proof(who, slots)
+            .block_id(block.unwrap_or_default())
+            .await?
+            .storage_hash
+            .to_string())
     }
 
     /// # Example
@@ -498,7 +583,8 @@ where
             B256::from_str("0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc")?;
         let value = self
             .provider
-            .get_storage_at(who, slot.into(), block.unwrap_or(BlockId::latest()))
+            .get_storage_at(who, slot.into())
+            .block_id(block.unwrap_or_default())
             .await?;
         let addr = Address::from_word(value.into());
         Ok(format!("{addr:?}"))
@@ -527,7 +613,8 @@ where
             B256::from_str("0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103")?;
         let value = self
             .provider
-            .get_storage_at(who, slot.into(), block.unwrap_or(BlockId::latest()))
+            .get_storage_at(who, slot.into())
+            .block_id(block.unwrap_or_default())
             .await?;
         let addr = Address::from_word(value.into());
         Ok(format!("{addr:?}"))
@@ -581,10 +668,14 @@ where
         disassemble: bool,
     ) -> Result<String> {
         if disassemble {
-            let code = self.provider.get_code_at(who, block.unwrap_or_default()).await?.to_vec();
+            let code =
+                self.provider.get_code_at(who).block_id(block.unwrap_or_default()).await?.to_vec();
             Ok(format_operations(disassemble_bytes(code)?)?)
         } else {
-            Ok(format!("{}", self.provider.get_code_at(who, block.unwrap_or_default()).await?))
+            Ok(format!(
+                "{}",
+                self.provider.get_code_at(who).block_id(block.unwrap_or_default()).await?
+            ))
         }
     }
 
@@ -607,7 +698,8 @@ where
     /// # }
     /// ```
     pub async fn codesize(&self, who: Address, block: Option<BlockId>) -> Result<String> {
-        let code = self.provider.get_code_at(who, block.unwrap_or_default()).await?.to_vec();
+        let code =
+            self.provider.get_code_at(who).block_id(block.unwrap_or_default()).await?.to_vec();
         Ok(format!("{}", code.len()))
     }
 
@@ -635,7 +727,11 @@ where
         to_json: bool,
     ) -> Result<String> {
         let tx_hash = TxHash::from_str(&tx_hash).wrap_err("invalid tx hash")?;
-        let tx = self.provider.get_transaction_by_hash(tx_hash).await?;
+        let tx = self
+            .provider
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .ok_or_else(|| eyre::eyre!("tx not found: {:?}", tx_hash))?;
 
         Ok(if raw {
             format!("0x{}", hex::encode(TxEnvelope::try_from(tx.inner)?.encoded_2718()))
@@ -661,7 +757,7 @@ where
     ///     ProviderBuilder::<_, _, AnyNetwork>::default().on_builtin("http://localhost:8545").await?;
     /// let cast = Cast::new(provider);
     /// let tx_hash = "0xf8d1713ea15a81482958fb7ddf884baee8d3bcc478c5f2f604e008dc788ee4fc";
-    /// let receipt = cast.receipt(tx_hash.to_string(), None, 1, false, false).await?;
+    /// let receipt = cast.receipt(tx_hash.to_string(), None, 1, None, false, false).await?;
     /// println!("{}", receipt);
     /// # Ok(())
     /// # }
@@ -671,6 +767,7 @@ where
         tx_hash: String,
         field: Option<String>,
         confs: u64,
+        timeout: Option<u64>,
         cast_async: bool,
         to_json: bool,
     ) -> Result<String> {
@@ -687,6 +784,7 @@ where
                     } else {
                         PendingTransactionBuilder::new(self.provider.root(), tx_hash)
                             .with_required_confirmations(confs)
+                            .with_timeout(timeout.map(Duration::from_secs))
                             .get_receipt()
                             .await?
                     }
@@ -769,7 +867,8 @@ where
             "{:?}",
             B256::from(
                 self.provider
-                    .get_storage_at(from, slot.into(), block.unwrap_or(BlockId::latest()))
+                    .get_storage_at(from, slot.into())
+                    .block_id(block.unwrap_or_default())
                     .await?
             )
         ))
@@ -837,8 +936,9 @@ where
             Some(block) => match block {
                 BlockId::Number(block_number) => Ok(Some(block_number)),
                 BlockId::Hash(hash) => {
-                    let block = self.provider.get_block_by_hash(hash.block_hash, false).await?;
-                    Ok(block.map(|block| block.header.number.unwrap()).map(BlockNumberOrTag::from))
+                    let block =
+                        self.provider.get_block_by_hash(hash.block_hash, false.into()).await?;
+                    Ok(block.map(|block| block.header.number).map(BlockNumberOrTag::from))
                 }
             },
             None => Ok(None),
@@ -855,7 +955,6 @@ where
     /// use alloy_rpc_types::Filter;
     /// use alloy_transport::BoxTransport;
     /// use cast::Cast;
-    /// use foundry_common::provider::alloy::get_http_provider as get_ws_provider;
     /// use std::{io, str::FromStr};
     ///
     /// # async fn foo() -> eyre::Result<()> {
@@ -904,7 +1003,7 @@ where
                     Either::Right(futures::future::pending())
                 } => {
                     if let (Some(block), Some(to_block)) = (block, to_block_number) {
-                        if block.header.number.map_or(false, |bn| bn > to_block) {
+                        if block.header.number  > to_block {
                             break;
                         }
                     }
@@ -917,12 +1016,12 @@ where
                         }
                         first = false;
                         let log_str = serde_json::to_string(&log).unwrap();
-                        write!(output, "{}", log_str)?;
+                        write!(output, "{log_str}")?;
                     } else {
                         let log_str = log.pretty()
                             .replacen('\n', "- ", 1)  // Remove empty first line
                             .replace('\n', "\n  ");  // Indent
-                        writeln!(output, "{}", log_str)?;
+                        writeln!(output, "{log_str}")?;
                     }
                 },
                 // Break on cancel signal, to allow for closing JSON bracket
@@ -954,19 +1053,6 @@ where
             .await?
             ._0)
     }
-}
-
-pub struct InterfaceSource {
-    pub name: String,
-    pub json_abi: String,
-    pub source: String,
-}
-
-// Local is a path to the directory containing the ABI files
-// In case of etherscan, ABI is fetched from the address on the chain
-pub enum AbiPath {
-    Local { path: String, name: Option<String> },
-    Etherscan { address: Address, chain: Chain, api_key: String },
 }
 
 pub struct SimpleCast;
@@ -1023,7 +1109,7 @@ impl SimpleCast {
                 if MAX {
                     let mut max = U256::MAX;
                     if n < 255 {
-                        max &= U256::from(1).wrapping_shl(n);
+                        max &= U256::from(1).wrapping_shl(n).wrapping_sub(U256::from(1));
                     }
                     Ok(max.to_string())
                 } else {
@@ -1050,6 +1136,24 @@ impl SimpleCast {
         hex::encode_prefixed(s)
     }
 
+    /// Converts hex input to UTF-8 text
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cast::SimpleCast as Cast;
+    ///
+    /// assert_eq!(Cast::to_utf8("0x796f")?, "yo");
+    /// assert_eq!(Cast::to_utf8("0x48656c6c6f2c20576f726c6421")?, "Hello, World!");
+    /// assert_eq!(Cast::to_utf8("0x547572626f44617070546f6f6c73")?, "TurboDappTools");
+    /// assert_eq!(Cast::to_utf8("0xe4bda0e5a5bd")?, "你好");
+    /// # Ok::<_, eyre::Report>(())
+    /// ```
+    pub fn to_utf8(s: &str) -> Result<String> {
+        let bytes = hex::decode(s)?;
+        Ok(String::from_utf8_lossy(bytes.as_ref()).to_string())
+    }
+
     /// Converts hex data into text data
     ///
     /// # Example
@@ -1065,7 +1169,7 @@ impl SimpleCast {
     pub fn to_ascii(hex: &str) -> Result<String> {
         let bytes = hex::decode(hex)?;
         if !bytes.iter().all(u8::is_ascii) {
-            return Err(eyre::eyre!("Invalid ASCII bytes"))
+            return Err(eyre::eyre!("Invalid ASCII bytes"));
         }
         Ok(String::from_utf8(bytes).unwrap())
     }
@@ -1325,7 +1429,7 @@ impl SimpleCast {
     /// assert_eq!(Cast::to_rlp("[]").unwrap(), "0xc0".to_string());
     /// assert_eq!(Cast::to_rlp("0x22").unwrap(), "0x22".to_string());
     /// assert_eq!(Cast::to_rlp("[\"0x61\"]",).unwrap(), "0xc161".to_string());
-    /// assert_eq!(Cast::to_rlp("[\"0xf1\",\"f2\"]").unwrap(), "0xc481f181f2".to_string());
+    /// assert_eq!(Cast::to_rlp("[\"0xf1\", \"f2\"]").unwrap(), "0xc481f181f2".to_string());
     /// # Ok::<_, eyre::Report>(())
     /// ```
     pub fn to_rlp(value: &str) -> Result<String> {
@@ -1367,7 +1471,7 @@ impl SimpleCast {
         let base_in = Base::unwrap_or_detect(base_in, value)?;
         let base_out: Base = base_out.parse()?;
         if base_in == base_out {
-            return Ok(value.to_string())
+            return Ok(value.to_string());
         }
 
         let mut n = NumberWithBase::parse_int(value, Some(&base_in.to_string()))?;
@@ -1431,7 +1535,7 @@ impl SimpleCast {
         let s = if let Some(stripped) = s.strip_prefix("000000000000000000000000") {
             stripped
         } else {
-            return Err(eyre::eyre!("Not convertible to address, there are non-zero bytes"))
+            return Err(eyre::eyre!("Not convertible to address, there are non-zero bytes"));
         };
 
         let lowercase_address_string = format!("0x{s}");
@@ -1448,7 +1552,7 @@ impl SimpleCast {
     ///
     /// ```
     /// use cast::SimpleCast as Cast;
-    /// use hex;
+    /// use alloy_primitives::hex;
     ///
     ///     // Passing `input = false` will decode the data as the output type.
     ///     // The input data types and the full function sig are ignored, i.e.
@@ -1468,7 +1572,7 @@ impl SimpleCast {
     ///         decoded[1].as_address().unwrap().to_string().to_lowercase(),
     ///         decoded[2].as_uint().unwrap().0.to_string(),
     ///         decoded[3].as_uint().unwrap().0.to_string(),
-    ///         hex::encode(decoded[4].as_bytes().unwrap())    
+    ///         hex::encode(decoded[4].as_bytes().unwrap())
     ///     ]
     ///     .into_iter()
     ///     .collect::<Vec<_>>();
@@ -1491,6 +1595,7 @@ impl SimpleCast {
     ///
     /// ```
     /// use cast::SimpleCast as Cast;
+    /// use alloy_primitives::hex;
     ///
     /// // Passing `input = false` will decode the data as the output type.
     /// // The input data types and the full function sig are ignored, i.e.
@@ -1543,12 +1648,10 @@ impl SimpleCast {
     /// ```
     pub fn abi_encode(sig: &str, args: &[impl AsRef<str>]) -> Result<String> {
         let func = get_func(sig)?;
-        let calldata = match encode_function_args(&func, args) {
-            Ok(res) => hex::encode(res),
+        match encode_function_args(&func, args) {
+            Ok(res) => Ok(hex::encode_prefixed(&res[4..])),
             Err(e) => eyre::bail!("Could not ABI encode the function and arguments. Did you pass in the right types?\nError\n{}", e),
-        };
-        let encoded = &calldata[8..];
-        Ok(format!("0x{encoded}"))
+        }
     }
 
     /// Performs packed ABI encoding based off of the function signature or tuple.
@@ -1599,62 +1702,6 @@ impl SimpleCast {
         let func = get_func(sig.as_ref())?;
         let calldata = encode_function_args(&func, args)?;
         Ok(hex::encode_prefixed(calldata))
-    }
-
-    /// Generates an interface in solidity from either a local file ABI or a verified contract on
-    /// Etherscan. It returns a vector of [`InterfaceSource`] structs that contain the source of the
-    /// interface and their name.
-    ///
-    /// Note: This removes the constructor from the ABI before generating the interface.
-    ///
-    /// ```no_run
-    /// use cast::{AbiPath, SimpleCast as Cast};
-    /// # async fn foo() -> eyre::Result<()> {
-    /// let path =
-    ///     AbiPath::Local { path: "utils/testdata/interfaceTestABI.json".to_owned(), name: None };
-    /// let interfaces = Cast::generate_interface(path).await?;
-    /// println!("interface {} {{\n {}\n}}", interfaces[0].name, interfaces[0].source);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn generate_interface(address_or_path: AbiPath) -> Result<Vec<InterfaceSource>> {
-        let (mut contract_abis, contract_names) = match address_or_path {
-            AbiPath::Local { path, name } => {
-                let file = std::fs::read_to_string(&path).wrap_err("unable to read abi file")?;
-                let obj: ContractObject = serde_json::from_str(&file)?;
-                let abi =
-                    obj.abi.ok_or_else(|| eyre::eyre!("could not find ABI in file {path}"))?;
-                (vec![abi], vec![name.unwrap_or_else(|| "Interface".to_owned())])
-            }
-            AbiPath::Etherscan { address, chain, api_key } => {
-                let client = Client::new(chain, api_key)?;
-                let source = client.contract_source_code(address).await?;
-                let names = source
-                    .items
-                    .iter()
-                    .map(|item| item.contract_name.clone())
-                    .collect::<Vec<String>>();
-
-                let abis = source.abis()?;
-
-                (abis, names)
-            }
-        };
-        contract_abis
-            .iter_mut()
-            .zip(contract_names)
-            .map(|(contract_abi, name)| {
-                // need to filter out the constructor
-                contract_abi.constructor.take();
-
-                let source = foundry_cli::utils::abi_to_solidity(contract_abi, &name)?;
-                Ok(InterfaceSource {
-                    name,
-                    json_abi: serde_json::to_string_pretty(contract_abi)?,
-                    source,
-                })
-            })
-            .collect::<Result<Vec<InterfaceSource>>>()
     }
 
     /// Prints the slot number for the specified mapping type and input data.
@@ -1876,6 +1923,37 @@ impl SimpleCast {
         Ok(())
     }
 
+    /// Fetches the source code of verified contracts from etherscan, flattens it and writes it to
+    /// the given path or stdout.
+    pub async fn etherscan_source_flatten(
+        chain: Chain,
+        contract_address: String,
+        etherscan_api_key: String,
+        output_path: Option<PathBuf>,
+    ) -> Result<()> {
+        let client = Client::new(chain, etherscan_api_key)?;
+        let metadata = client.contract_source_code(contract_address.parse()?).await?;
+        let Some(metadata) = metadata.items.first() else {
+            eyre::bail!("Empty contract source code")
+        };
+
+        let tmp = tempfile::tempdir()?;
+        let project = etherscan_project(metadata, tmp.path())?;
+        let target_path = project.find_contract_path(&metadata.contract_name)?;
+
+        let flattened = Flattener::new(project, &target_path)?.flatten();
+
+        if let Some(path) = output_path {
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(&path, flattened)?;
+            println!("Flattened file written at {}", path.display());
+        } else {
+            println!("{flattened}");
+        }
+
+        Ok(())
+    }
+
     /// Disassembles hex encoded bytecode into individual / human readable opcodes
     ///
     /// # Example
@@ -1911,7 +1989,7 @@ impl SimpleCast {
         }
         if optimize == 0 {
             let selector = get_func(signature)?.selector();
-            return Ok((selector.to_string(), String::from(signature)))
+            return Ok((selector.to_string(), String::from(signature)));
         }
         let Some((name, params)) = signature.split_once('(') else {
             eyre::bail!("invalid function signature");
@@ -1927,13 +2005,13 @@ impl SimpleCast {
 
                 let mut nonce = nonce_start;
                 while nonce < u32::MAX && !found.load(Ordering::Relaxed) {
-                    let input = format!("{}{}({}", name, nonce, params);
+                    let input = format!("{name}{nonce}({params}");
                     let hash = keccak256(input.as_bytes());
                     let selector = &hash[..4];
 
                     if selector.iter().take_while(|&&byte| byte == 0).count() == optimize {
                         found.store(true, Ordering::Relaxed);
-                        return Some((nonce, hex::encode_prefixed(selector), input))
+                        return Some((nonce, hex::encode_prefixed(selector), input));
                     }
 
                     nonce += nonce_step;
@@ -1947,7 +2025,7 @@ impl SimpleCast {
         }
     }
 
-    /// Extracts function selectors and arguments from bytecode
+    /// Extracts function selectors, arguments and state mutability from bytecode
     ///
     /// # Example
     ///
@@ -1955,16 +2033,21 @@ impl SimpleCast {
     /// use cast::SimpleCast as Cast;
     ///
     /// let bytecode = "6080604052348015600e575f80fd5b50600436106026575f3560e01c80632125b65b14602a575b5f80fd5b603a6035366004603c565b505050565b005b5f805f60608486031215604d575f80fd5b833563ffffffff81168114605f575f80fd5b925060208401356001600160a01b03811681146079575f80fd5b915060408401356001600160e01b03811681146093575f80fd5b80915050925092509256";
-    /// let selectors = Cast::extract_selectors(bytecode)?;
-    /// assert_eq!(selectors, vec![("0x2125b65b".to_string(), "uint32,address,uint224".to_string())]);
+    /// let functions = Cast::extract_functions(bytecode)?;
+    /// assert_eq!(functions, vec![("0x2125b65b".to_string(), "uint32,address,uint224".to_string(), "pure")]);
     /// # Ok::<(), eyre::Report>(())
     /// ```
-    pub fn extract_selectors(bytecode: &str) -> Result<Vec<(String, String)>> {
+    pub fn extract_functions(bytecode: &str) -> Result<Vec<(String, String, &str)>> {
         let code = hex::decode(strip_0x(bytecode))?;
-        let s = evmole::function_selectors(&code, 0);
-
-        Ok(s.iter()
-            .map(|s| (hex::encode_prefixed(s), evmole::function_arguments(&code, s, 0)))
+        Ok(evmole::function_selectors(&code, 0)
+            .into_iter()
+            .map(|s| {
+                (
+                    hex::encode_prefixed(s),
+                    evmole::function_arguments(&code, &s, 0),
+                    evmole::function_state_mutability(&code, &s, 0).as_json_str(),
+                )
+            })
             .collect())
     }
 
@@ -1983,6 +2066,24 @@ impl SimpleCast {
         let tx_hex = hex::decode(strip_0x(tx))?;
         let tx = TxEnvelope::decode_2718(&mut tx_hex.as_slice())?;
         Ok(tx)
+    }
+
+    /// Decodes EOF container bytes
+    /// Pretty prints the decoded EOF container contents
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use cast::SimpleCast as Cast;
+    ///
+    /// let eof = "0xef0001010004020001005604002000008000046080806040526004361015e100035f80fd5f3560e01c63773d45e01415e1ffee6040600319360112e10028600435906024358201809211e100066020918152f3634e487b7160e01b5f52601160045260245ffd5f80fd0000000000000000000000000124189fc71496f8660db5189f296055ed757632";
+    /// let decoded = Cast::decode_eof(&eof)?;
+    /// println!("{}", decoded);
+    /// # Ok::<(), eyre::Report>(())
+    pub fn decode_eof(eof: &str) -> Result<String> {
+        let eof_hex = hex::decode(eof)?;
+        let eof = Eof::decode(eof_hex.into())?;
+        Ok(pretty_eof(&eof)?)
     }
 }
 

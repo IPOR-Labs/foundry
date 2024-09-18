@@ -13,7 +13,7 @@ use eyre::{Result, WrapErr};
 use foundry_compilers::Artifact;
 use foundry_evm::{
     backend::Backend, decode::decode_console_logs, executors::ExecutorBuilder,
-    inspectors::CheatsConfig,
+    inspectors::CheatsConfig, traces::TraceMode,
 };
 use solang_parser::pt::{self, CodeLocation};
 use std::str::FromStr;
@@ -91,15 +91,15 @@ impl SessionSource {
                 // Map the source location of the final statement of the `run()` function to its
                 // corresponding runtime program counter
                 let final_pc = {
-                    let offset = source_loc.start();
-                    let length = source_loc.end() - source_loc.start();
+                    let offset = source_loc.start() as u32;
+                    let length = (source_loc.end() - source_loc.start()) as u32;
                     contract
                         .get_source_map_deployed()
                         .unwrap()
                         .unwrap()
                         .into_iter()
                         .zip(InstructionIter::new(&deployed_bytecode))
-                        .filter(|(s, _)| s.offset == offset && s.length == length)
+                        .filter(|(s, _)| s.offset() == offset && s.length() == length)
                         .map(|(_, i)| i.pc)
                         .max()
                         .unwrap_or_default()
@@ -189,7 +189,7 @@ impl SessionSource {
 
         let Some((stack, memory, _)) = &res.state else {
             // Show traces and logs, if there are any, and return an error
-            if let Ok(decoder) = ChiselDispatcher::decode_traces(&source.config, &mut res) {
+            if let Ok(decoder) = ChiselDispatcher::decode_traces(&source.config, &mut res).await {
                 ChiselDispatcher::show_traces(&decoder, &mut res).await?;
             }
             let decoded_logs = decode_console_logs(&res.logs);
@@ -279,7 +279,7 @@ impl SessionSource {
     ///
     /// ### Takes
     ///
-    /// The final statement's program counter for the [ChiselInspector]
+    /// The final statement's program counter for the ChiselInspector
     ///
     /// ### Returns
     ///
@@ -302,19 +302,20 @@ impl SessionSource {
         // Build a new executor
         let executor = ExecutorBuilder::new()
             .inspectors(|stack| {
-                stack.chisel_state(final_pc).trace(true).cheatcodes(
+                stack.chisel_state(final_pc).trace_mode(TraceMode::Call).cheatcodes(
                     CheatsConfig::new(
                         &self.config.foundry_config,
                         self.config.evm_opts.clone(),
                         None,
                         None,
-                        self.solc.version().ok(),
+                        Some(self.solc.version.clone()),
                     )
                     .into(),
                 )
             })
             .gas_limit(self.config.evm_opts.gas_limit())
             .spec(self.config.foundry_config.evm_spec_id())
+            .legacy_assertions(self.config.foundry_config.legacy_assertions)
             .build(env, backend);
 
         // Create a [ChiselRunner] with a default balance of [U256::MAX] and
@@ -323,17 +324,8 @@ impl SessionSource {
     }
 }
 
-/// Formats a [Token] into an inspection message
-///
-/// ### Takes
-///
-/// An owned [Token]
-///
-/// ### Returns
-///
-/// A formatted [Token] for use in inspection output.
-///
-/// TODO: Verbosity option
+/// Formats a value into an inspection message
+// TODO: Verbosity option
 fn format_token(token: DynSolValue) -> String {
     match token {
         DynSolValue::Address(a) => {
@@ -349,7 +341,7 @@ fn format_token(token: DynSolValue) -> String {
         DynSolValue::Int(i, bit_len) => {
             format!(
                 "Type: {}\n├ Hex: {}\n├ Hex (full word): {}\n└ Decimal: {}",
-                format!("int{}", bit_len).red(),
+                format!("int{bit_len}").red(),
                 format!(
                     "0x{}",
                     format!("{i:x}")
@@ -367,7 +359,7 @@ fn format_token(token: DynSolValue) -> String {
         DynSolValue::Uint(i, bit_len) => {
             format!(
                 "Type: {}\n├ Hex: {}\n├ Hex (full word): {}\n└ Decimal: {}",
-                format!("uint{}", bit_len).red(),
+                format!("uint{bit_len}").red(),
                 format!(
                     "0x{}",
                     format!("{i:x}")
@@ -426,8 +418,7 @@ fn format_token(token: DynSolValue) -> String {
         DynSolValue::Tuple(tokens) => {
             let displayed_types = tokens
                 .iter()
-                .map(|t| t.sol_type_name().to_owned())
-                .map(|t| t.unwrap_or_default().into_owned())
+                .map(|t| t.sol_type_name().unwrap_or_default())
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut out =
@@ -755,7 +746,7 @@ impl Type {
                     .map(|(returns, _)| map_parameters(returns))
                     .unwrap_or_default();
                 Self::Function(
-                    Box::new(Type::Custom(vec!["__fn_type__".to_string()])),
+                    Box::new(Self::Custom(vec!["__fn_type__".to_string()])),
                     params,
                     returns,
                 )
@@ -900,7 +891,7 @@ impl Type {
 
     /// Recurses over itself, appending all the idents and function arguments in the order that they
     /// are found
-    fn recurse(&self, types: &mut Vec<String>, args: &mut Option<Vec<Option<Type>>>) {
+    fn recurse(&self, types: &mut Vec<String>, args: &mut Option<Vec<Option<Self>>>) {
         match self {
             Self::Builtin(ty) => types.push(ty.to_string()),
             Self::Custom(tys) => types.extend(tys.clone()),
@@ -1167,7 +1158,7 @@ impl Type {
             .function_definitions
             .get(&function_name.name)?;
         let return_parameter = contract.as_ref().returns.first()?.to_owned().1?;
-        Type::ethabi(&return_parameter.ty, Some(intermediate)).map(|p| (contract_expr.unwrap(), p))
+        Self::ethabi(&return_parameter.ty, Some(intermediate)).map(|p| (contract_expr.unwrap(), p))
     }
 
     /// Inverts Int to Uint and viceversa.
@@ -1210,12 +1201,9 @@ impl Type {
     #[inline]
     fn is_dynamic(&self) -> bool {
         match self {
-            Self::Builtin(ty) => match ty {
-                // TODO: Note, this is not entirely correct. Fixed arrays of non-dynamic types are
-                // not dynamic, nor are tuples of non-dynamic types.
-                DynSolType::Bytes | DynSolType::String | DynSolType::Array(_) => true,
-                _ => false,
-            },
+            // TODO: Note, this is not entirely correct. Fixed arrays of non-dynamic types are
+            // not dynamic, nor are tuples of non-dynamic types.
+            Self::Builtin(DynSolType::Bytes | DynSolType::String | DynSolType::Array(_)) => true,
             Self::Array(_) => true,
             _ => false,
         }
@@ -1404,7 +1392,8 @@ impl<'a> Iterator for InstructionIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use foundry_compilers::{error::SolcError, Solc};
+    use foundry_compilers::{error::SolcError, solc::Solc};
+    use semver::Version;
     use std::sync::Mutex;
 
     #[test]
@@ -1688,10 +1677,10 @@ mod tests {
         for _ in 0..3 {
             let mut is_preinstalled = PRE_INSTALL_SOLC_LOCK.lock().unwrap();
             if !*is_preinstalled {
-                let solc = Solc::find_or_install_svm_version(version)
-                    .and_then(|solc| solc.version().map(|v| (solc, v)));
+                let solc = Solc::find_or_install(&version.parse().unwrap())
+                    .map(|solc| (solc.version.clone(), solc));
                 match solc {
-                    Ok((solc, v)) => {
+                    Ok((v, solc)) => {
                         // successfully installed
                         eprintln!("found installed Solc v{v} @ {}", solc.solc.display());
                         break
@@ -1700,7 +1689,7 @@ mod tests {
                         // try reinstalling
                         eprintln!("error while trying to re-install Solc v{version}: {e}");
                         let solc = Solc::blocking_install(&version.parse().unwrap());
-                        if solc.map_err(SolcError::from).and_then(|solc| solc.version()).is_ok() {
+                        if solc.map_err(SolcError::from).is_ok() {
                             *is_preinstalled = true;
                             break
                         }
@@ -1709,7 +1698,7 @@ mod tests {
             }
         }
 
-        let solc = Solc::find_or_install_svm_version("0.8.19").expect("could not install solc");
+        let solc = Solc::find_or_install(&Version::new(0, 8, 19)).expect("could not install solc");
         SessionSource::new(solc, Default::default())
     }
 

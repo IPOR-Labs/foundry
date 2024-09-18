@@ -1,3 +1,4 @@
+use alloy_primitives::hex;
 use clap::Parser;
 use comfy_table::Table;
 use eyre::Result;
@@ -55,12 +56,23 @@ pub enum SelectorsSubcommands {
         #[command(flatten)]
         project_paths: ProjectPathsArgs,
     },
+
+    /// Find if a selector is present in the project
+    #[command(visible_alias = "f")]
+    Find {
+        /// The selector to search for
+        #[arg(help = "The selector to search for (with or without 0x prefix)")]
+        selector: String,
+
+        #[command(flatten)]
+        project_paths: ProjectPathsArgs,
+    },
 }
 
 impl SelectorsSubcommands {
     pub async fn run(self) -> Result<()> {
         match self {
-            SelectorsSubcommands::Upload { contract, all, project_paths } => {
+            Self::Upload { contract, all, project_paths } => {
                 let build_args = CoreBuildArgs {
                     project_paths: project_paths.clone(),
                     compiler: CompilerArgs {
@@ -81,8 +93,7 @@ impl SelectorsSubcommands {
                     output
                         .into_artifacts_with_files()
                         .filter(|(file, _, _)| {
-                            let is_sources_path = file
-                                .starts_with(&project.paths.sources.to_string_lossy().to_string());
+                            let is_sources_path = file.starts_with(&project.paths.sources);
                             let is_test = file.is_sol_test();
 
                             is_sources_path && !is_test
@@ -119,7 +130,7 @@ impl SelectorsSubcommands {
                     }
                 }
             }
-            SelectorsSubcommands::Collision { mut first_contract, mut second_contract, build } => {
+            Self::Collision { mut first_contract, mut second_contract, build } => {
                 // Compile the project with the two contracts included
                 let project = build.project()?;
                 let mut compiler = ProjectCompiler::new().quiet(true);
@@ -175,10 +186,10 @@ impl SelectorsSubcommands {
                     println!("{table}");
                 }
             }
-            SelectorsSubcommands::List { contract, project_paths } => {
+            Self::List { contract, project_paths } => {
                 println!("Listing selectors for contracts in the project...");
                 let build_args = CoreBuildArgs {
-                    project_paths: project_paths.clone(),
+                    project_paths,
                     compiler: CompilerArgs {
                         extra_output: vec![ContractOutputSelection::Abi],
                         ..Default::default()
@@ -200,7 +211,7 @@ impl SelectorsSubcommands {
                             let suggestion = if let Some(suggestion) = foundry_cli::utils::did_you_mean(&contract, candidates).pop() {
                                 format!("\nDid you mean `{suggestion}`?")
                             } else {
-                                "".to_string()
+                                String::new()
                             };
                             eyre::eyre!(
                                 "Could not find artifact `{contract}` in the compiled artifacts{suggestion}",
@@ -212,8 +223,7 @@ impl SelectorsSubcommands {
                     outcome
                         .into_artifacts_with_files()
                         .filter(|(file, _, _)| {
-                            let is_sources_path = file
-                                .starts_with(&project.paths.sources.to_string_lossy().to_string());
+                            let is_sources_path = file.starts_with(&project.paths.sources);
                             let is_test = file.is_sol_test();
 
                             is_sources_path && !is_test
@@ -259,6 +269,83 @@ impl SelectorsSubcommands {
                     if artifacts.peek().is_some() {
                         println!()
                     }
+                }
+            }
+
+            Self::Find { selector, project_paths } => {
+                println!("Searching for selector {selector:?} in the project...");
+
+                let build_args = CoreBuildArgs {
+                    project_paths,
+                    compiler: CompilerArgs {
+                        extra_output: vec![ContractOutputSelection::Abi],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+
+                let project = build_args.project()?;
+                let outcome = ProjectCompiler::new().quiet(true).compile(&project)?;
+                let artifacts = outcome
+                    .into_artifacts_with_files()
+                    .filter(|(file, _, _)| {
+                        let is_sources_path = file.starts_with(&project.paths.sources);
+                        let is_test = file.is_sol_test();
+                        is_sources_path && !is_test
+                    })
+                    .collect::<Vec<_>>();
+
+                let mut table = Table::new();
+
+                table.set_header(["Type", "Signature", "Selector", "Contract"]);
+
+                for (_file, contract, artifact) in artifacts {
+                    let abi = artifact.abi.ok_or_else(|| eyre::eyre!("Unable to fetch abi"))?;
+
+                    let selector_bytes =
+                        hex::decode(selector.strip_prefix("0x").unwrap_or(&selector))?;
+
+                    for func in abi.functions() {
+                        if func.selector().as_slice().starts_with(selector_bytes.as_slice()) {
+                            table.add_row([
+                                "Function",
+                                &func.signature(),
+                                &hex::encode_prefixed(func.selector()),
+                                contract.as_str(),
+                            ]);
+                        }
+                    }
+
+                    for event in abi.events() {
+                        if event.selector().as_slice().starts_with(selector_bytes.as_slice()) {
+                            table.add_row([
+                                "Event",
+                                &event.signature(),
+                                &hex::encode_prefixed(event.selector()),
+                                contract.as_str(),
+                            ]);
+                        }
+                    }
+
+                    for error in abi.errors() {
+                        if error.selector().as_slice().starts_with(selector_bytes.as_slice()) {
+                            table.add_row([
+                                "Error",
+                                &error.signature(),
+                                &hex::encode_prefixed(error.selector()),
+                                contract.as_str(),
+                            ]);
+                        }
+                    }
+                }
+
+                if table.row_count() > 0 {
+                    println!();
+                    println!("Found {} instance(s)...", table.row_count());
+                    println!("{table}");
+                } else {
+                    println!();
+                    return Err(eyre::eyre!("Selector not found in the project."));
                 }
             }
         }

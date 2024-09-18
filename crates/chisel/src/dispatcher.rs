@@ -17,11 +17,11 @@ use foundry_config::{Config, RpcEndpoint};
 use foundry_evm::{
     decode::decode_console_logs,
     traces::{
+        decode_trace_arena,
         identifier::{SignaturesIdentifier, TraceIdentifiers},
         render_trace_arena, CallTraceDecoder, CallTraceDecoderBuilder, TraceKind,
     },
 };
-use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Command,
+    sync::LazyLock,
 };
 use strum::IntoEnumIterator;
 use tracing::debug;
@@ -47,11 +48,11 @@ pub static COMMAND_LEADER: char = '!';
 pub static CHISEL_CHAR: &str = "⚒️";
 
 /// Matches Solidity comments
-static COMMENT_RE: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^\s*(?://.*\s*$)|(/*[\s\S]*?\*/\s*$)").unwrap());
+static COMMENT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?://.*\s*$)|(/*[\s\S]*?\*/\s*$)").unwrap());
 
 /// Matches Ethereum addresses that are not strings
-static ADDRESS_RE: Lazy<Regex> = Lazy::new(|| {
+static ADDRESS_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)(([^"']\s*)|^)(?P<address>0x[a-fA-F0-9]{40})((\s*[^"'\w])|$)"#).unwrap()
 });
 
@@ -86,11 +87,11 @@ impl DispatchResult {
     pub fn is_error(&self) -> bool {
         matches!(
             self,
-            DispatchResult::Failure(_) |
-                DispatchResult::CommandFailed(_) |
-                DispatchResult::UnrecognizedCommand(_) |
-                DispatchResult::SolangParserFailed(_) |
-                DispatchResult::FileIoError(_)
+            Self::Failure(_) |
+                Self::CommandFailed(_) |
+                Self::UnrecognizedCommand(_) |
+                Self::SolangParserFailed(_) |
+                Self::FileIoError(_)
         )
     }
 }
@@ -414,8 +415,7 @@ impl ChiselDispatcher {
                         )))
                     }
                     Err(e) => DispatchResult::CommandFailed(Self::make_error(format!(
-                        "Invalid calldata: {}",
-                        e
+                        "Invalid calldata: {e}"
                     ))),
                 }
             }
@@ -689,7 +689,7 @@ impl ChiselDispatcher {
                         let failed = !res.success;
                         if new_session_source.config.traces || failed {
                             if let Ok(decoder) =
-                                Self::decode_traces(&new_session_source.config, &mut res)
+                                Self::decode_traces(&new_session_source.config, &mut res).await
                             {
                                 if let Err(e) = Self::show_traces(&decoder, &mut res).await {
                                     return DispatchResult::CommandFailed(e.to_string())
@@ -834,7 +834,8 @@ impl ChiselDispatcher {
                     // If traces are enabled or there was an error in execution, show the execution
                     // traces.
                     if new_source.config.traces || failed {
-                        if let Ok(decoder) = Self::decode_traces(&new_source.config, &mut res) {
+                        if let Ok(decoder) = Self::decode_traces(&new_source.config, &mut res).await
+                        {
                             if let Err(e) = Self::show_traces(&decoder, &mut res).await {
                                 return DispatchResult::CommandFailed(e.to_string())
                             };
@@ -888,7 +889,7 @@ impl ChiselDispatcher {
     /// ### Returns
     ///
     /// Optionally, a [CallTraceDecoder]
-    pub fn decode_traces(
+    pub async fn decode_traces(
         session_config: &SessionSourceConfig,
         result: &mut ChiselResult,
         // known_contracts: &ContractsByArtifact,
@@ -903,7 +904,7 @@ impl ChiselDispatcher {
 
         let mut identifier = TraceIdentifiers::new().with_etherscan(
             &session_config.foundry_config,
-            session_config.evm_opts.get_remote_chain_id(),
+            session_config.evm_opts.get_remote_chain_id().await,
         )?;
         if !identifier.is_empty() {
             for (_, trace) in &mut result.traces {
@@ -932,17 +933,18 @@ impl ChiselDispatcher {
         }
 
         println!("{}", "Traces:".green());
-        for (kind, trace) in &result.traces {
+        for (kind, trace) in &mut result.traces {
             // Display all Setup + Execution traces.
             if matches!(kind, TraceKind::Setup | TraceKind::Execution) {
-                println!("{}", render_trace_arena(trace, decoder).await?);
+                decode_trace_arena(trace, decoder).await?;
+                println!("{}", render_trace_arena(trace));
             }
         }
 
         Ok(())
     }
 
-    /// Format a type that implements [fmt::Display] as a chisel error string.
+    /// Format a type that implements [std::fmt::Display] as a chisel error string.
     ///
     /// ### Takes
     ///

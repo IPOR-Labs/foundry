@@ -101,7 +101,7 @@ impl SolidityHelper {
     }
 
     /// Highlights a solidity source string
-    pub fn highlight(input: &str) -> Cow<str> {
+    pub fn highlight(input: &str) -> Cow<'_, str> {
         if !yansi::is_enabled() {
             return Cow::Borrowed(input)
         }
@@ -211,7 +211,7 @@ impl Highlighter for SolidityHelper {
         Self::highlight(line)
     }
 
-    fn highlight_char(&self, line: &str, pos: usize) -> bool {
+    fn highlight_char(&self, line: &str, pos: usize, _forced: bool) -> bool {
         pos == line.len()
     }
 
@@ -256,7 +256,7 @@ impl Highlighter for SolidityHelper {
 }
 
 impl Validator for SolidityHelper {
-    fn validate(&self, ctx: &mut ValidationContext) -> rustyline::Result<ValidationResult> {
+    fn validate(&self, ctx: &mut ValidationContext<'_>) -> rustyline::Result<ValidationResult> {
         Ok(Self::validate_closed(ctx.input()))
     }
 }

@@ -2,16 +2,17 @@
 //!
 //! EVM fuzzing implementation using [`proptest`].
 
-#![warn(unreachable_pub, unused_crate_dependencies, rust_2018_idioms)]
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
 #[macro_use]
 extern crate tracing;
 
 use alloy_dyn_abi::{DynSolValue, JsonAbiExt};
 use alloy_primitives::{Address, Bytes, Log};
-use foundry_common::{calc, contracts::ContractsByAddress};
+use foundry_common::{calc, contracts::ContractsByAddress, evm::Breakpoints};
 use foundry_evm_coverage::HitMaps;
-use foundry_evm_traces::CallTraceArena;
+use foundry_evm_traces::{CallTraceArena, SparsedTraceArena};
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt, sync::Arc};
@@ -43,50 +44,70 @@ pub struct BaseCounterExample {
     pub addr: Option<Address>,
     /// The data to provide
     pub calldata: Bytes,
-    /// Function signature if it exists
-    pub signature: Option<String>,
     /// Contract name if it exists
     pub contract_name: Option<String>,
+    /// Function signature if it exists
+    pub signature: Option<String>,
+    /// Args used to call the function
+    pub args: Option<String>,
     /// Traces
     #[serde(skip)]
-    pub traces: Option<CallTraceArena>,
-    #[serde(skip)]
-    pub args: Vec<DynSolValue>,
+    pub traces: Option<SparsedTraceArena>,
 }
 
 impl BaseCounterExample {
-    pub fn create(
+    /// Creates counter example representing a step from invariant call sequence.
+    pub fn from_invariant_call(
         sender: Address,
         addr: Address,
         bytes: &Bytes,
         contracts: &ContractsByAddress,
-        traces: Option<CallTraceArena>,
+        traces: Option<SparsedTraceArena>,
     ) -> Self {
         if let Some((name, abi)) = &contracts.get(&addr) {
             if let Some(func) = abi.functions().find(|f| f.selector() == bytes[..4]) {
                 // skip the function selector when decoding
                 if let Ok(args) = func.abi_decode_input(&bytes[4..], false) {
-                    return BaseCounterExample {
+                    return Self {
                         sender: Some(sender),
                         addr: Some(addr),
                         calldata: bytes.clone(),
-                        signature: Some(func.signature()),
                         contract_name: Some(name.clone()),
+                        signature: Some(func.signature()),
+                        args: Some(
+                            foundry_common::fmt::format_tokens(&args).format(", ").to_string(),
+                        ),
                         traces,
-                        args,
                     };
                 }
             }
         }
 
-        BaseCounterExample {
+        Self {
             sender: Some(sender),
             addr: Some(addr),
             calldata: bytes.clone(),
-            signature: None,
             contract_name: None,
+            signature: None,
+            args: None,
             traces,
-            args: vec![],
+        }
+    }
+
+    /// Creates counter example for a fuzz test failure.
+    pub fn from_fuzz_call(
+        bytes: Bytes,
+        args: Vec<DynSolValue>,
+        traces: Option<SparsedTraceArena>,
+    ) -> Self {
+        Self {
+            sender: None,
+            addr: None,
+            calldata: bytes,
+            contract_name: None,
+            signature: None,
+            args: Some(foundry_common::fmt::format_tokens(&args).format(", ").to_string()),
+            traces,
         }
     }
 }
@@ -108,10 +129,14 @@ impl fmt::Display for BaseCounterExample {
         if let Some(sig) = &self.signature {
             write!(f, "calldata={sig}")?
         } else {
-            write!(f, "calldata={}", self.calldata)?
+            write!(f, "calldata={}", &self.calldata)?
         }
 
-        write!(f, " args=[{}]", foundry_common::fmt::format_tokens(&self.args).format(", "))
+        if let Some(args) = &self.args {
+            write!(f, " args=[{args}]")
+        } else {
+            write!(f, " args=[]")
+        }
     }
 }
 
@@ -126,6 +151,8 @@ pub struct FuzzTestResult {
     /// properly, or that there was a revert and that the test was expected to fail
     /// (prefixed with `testFail`)
     pub success: bool,
+    /// Whether the test case was skipped. `reason` will contain the skip reason, if any.
+    pub skipped: bool,
 
     /// If there was a revert, this field will be populated. Note that the test can
     /// still be successful (i.e self.success == true) when it's expected to fail.
@@ -138,9 +165,6 @@ pub struct FuzzTestResult {
     /// be printed to the user.
     pub logs: Vec<Log>,
 
-    /// The decoded DSTest logging events and Hardhat's `console.log` from [logs](Self::logs).
-    pub decoded_logs: Vec<String>,
-
     /// Labeled addresses
     pub labeled_addresses: HashMap<Address, String>,
 
@@ -148,7 +172,7 @@ pub struct FuzzTestResult {
     ///
     /// **Note** We only store a single trace of a successful fuzz call, otherwise we would get
     /// `num(fuzz_cases)` traces, one for each run, which is neither helpful nor performant.
-    pub traces: Option<CallTraceArena>,
+    pub traces: Option<SparsedTraceArena>,
 
     /// Additional traces used for gas report construction.
     /// Those traces should not be displayed.
@@ -156,6 +180,9 @@ pub struct FuzzTestResult {
 
     /// Raw coverage info
     pub coverage: Option<HitMaps>,
+
+    /// Breakpoints for debugger. Correspond to the same fuzz case as `traces`.
+    pub breakpoints: Option<Breakpoints>,
 }
 
 impl FuzzTestResult {
@@ -274,6 +301,7 @@ impl FuzzedCases {
 }
 
 /// Fixtures to be used for fuzz tests.
+///
 /// The key represents name of the fuzzed parameter, value holds possible fuzzed values.
 /// For example, for a fixture function declared as
 /// `function fixture_sender() external returns (address[] memory senders)`
@@ -284,17 +312,14 @@ pub struct FuzzFixtures {
 }
 
 impl FuzzFixtures {
-    pub fn new(fixtures: HashMap<String, DynSolValue>) -> FuzzFixtures {
+    pub fn new(fixtures: HashMap<String, DynSolValue>) -> Self {
         Self { inner: Arc::new(fixtures) }
     }
 
     /// Returns configured fixtures for `param_name` fuzzed parameter.
     pub fn param_fixtures(&self, param_name: &str) -> Option<&[DynSolValue]> {
         if let Some(param_fixtures) = self.inner.get(&normalize_fixture(param_name)) {
-            match param_fixtures {
-                DynSolValue::FixedArray(_) => param_fixtures.as_fixed_array(),
-                _ => param_fixtures.as_array(),
-            }
+            param_fixtures.as_fixed_array().or_else(|| param_fixtures.as_array())
         } else {
             None
         }
@@ -309,5 +334,5 @@ pub fn fixture_name(function_name: String) -> String {
 
 /// Normalize fixture parameter name, for example `_Owner` to `owner`.
 fn normalize_fixture(param_name: &str) -> String {
-    param_name.trim_matches(&['_']).to_ascii_lowercase()
+    param_name.trim_matches('_').to_ascii_lowercase()
 }

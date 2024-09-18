@@ -3,12 +3,45 @@
 use crate::abi::{Console, Vm};
 use alloy_dyn_abi::JsonAbiExt;
 use alloy_json_abi::{Error, JsonAbi};
-use alloy_primitives::{Log, Selector};
+use alloy_primitives::{hex, Log, Selector};
 use alloy_sol_types::{SolCall, SolError, SolEventInterface, SolInterface, SolValue};
 use foundry_common::SELECTOR_LEN;
 use itertools::Itertools;
 use revm::interpreter::InstructionResult;
-use std::{collections::HashMap, sync::OnceLock};
+use rustc_hash::FxHashMap;
+use std::{fmt, sync::OnceLock};
+
+/// A skip reason.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SkipReason(pub Option<String>);
+
+impl SkipReason {
+    /// Decodes a skip reason, if any.
+    pub fn decode(raw_result: &[u8]) -> Option<Self> {
+        raw_result.strip_prefix(crate::constants::MAGIC_SKIP).map(|reason| {
+            let reason = String::from_utf8_lossy(reason).into_owned();
+            Self((!reason.is_empty()).then_some(reason))
+        })
+    }
+
+    /// Decodes a skip reason from a string that was obtained by formatting `Self`.
+    ///
+    /// This is a hack to support re-decoding a skip reason in proptest.
+    pub fn decode_self(s: &str) -> Option<Self> {
+        s.strip_prefix("skipped").map(|rest| Self(rest.strip_prefix(": ").map(ToString::to_string)))
+    }
+}
+
+impl fmt::Display for SkipReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("skipped")?;
+        if let Some(reason) = &self.0 {
+            f.write_str(": ")?;
+            f.write_str(reason)?;
+        }
+        Ok(())
+    }
+}
 
 /// Decode a set of logs, only returning logs from DSTest logging events and Hardhat's `console.log`
 pub fn decode_console_logs(logs: &[Log]) -> Vec<String> {
@@ -27,7 +60,7 @@ pub fn decode_console_log(log: &Log) -> Option<String> {
 #[derive(Clone, Debug, Default)]
 pub struct RevertDecoder {
     /// The custom errors to use for decoding.
-    pub errors: HashMap<Selector, Vec<Error>>,
+    pub errors: FxHashMap<Selector, Vec<Error>>,
 }
 
 impl Default for &RevertDecoder {
@@ -104,7 +137,7 @@ impl RevertDecoder {
 
     /// Tries to decode an error message from the given revert bytes.
     ///
-    /// See [`decode_revert`] for more information.
+    /// See [`decode`](Self::decode) for more information.
     pub fn maybe_decode(&self, err: &[u8], status: Option<InstructionResult>) -> Option<String> {
         if err.len() < SELECTOR_LEN {
             if let Some(status) = status {
@@ -119,9 +152,8 @@ impl RevertDecoder {
             };
         }
 
-        if err == crate::constants::MAGIC_SKIP {
-            // Also used in forge fuzz runner
-            return Some("SKIPPED".to_string());
+        if let Some(reason) = SkipReason::decode(err) {
+            return Some(reason.to_string());
         }
 
         // Solidity's `Error(string)` or `Panic(uint256)`
@@ -143,9 +175,29 @@ impl RevertDecoder {
                 let e = Vm::expectRevert_2Call::abi_decode_raw(data, false).ok()?;
                 return self.maybe_decode(&e.revertData[..], status);
             }
+            // `expectRevert(bytes,address)`
+            Vm::expectRevert_5Call::SELECTOR => {
+                let e = Vm::expectRevert_5Call::abi_decode_raw(data, false).ok()?;
+                return self.maybe_decode(&e.revertData[..], status);
+            }
             // `expectRevert(bytes4)`
             Vm::expectRevert_1Call::SELECTOR => {
                 let e = Vm::expectRevert_1Call::abi_decode_raw(data, false).ok()?;
+                return self.maybe_decode(&e.revertData[..], status);
+            }
+            // `expectRevert(bytes4,address)`
+            Vm::expectRevert_4Call::SELECTOR => {
+                let e = Vm::expectRevert_4Call::abi_decode_raw(data, false).ok()?;
+                return self.maybe_decode(&e.revertData[..], status);
+            }
+            // `expectPartialRevert(bytes4)`
+            Vm::expectPartialRevert_0Call::SELECTOR => {
+                let e = Vm::expectPartialRevert_0Call::abi_decode_raw(data, false).ok()?;
+                return self.maybe_decode(&e.revertData[..], status);
+            }
+            // `expectPartialRevert(bytes4,address)`
+            Vm::expectPartialRevert_1Call::SELECTOR => {
+                let e = Vm::expectPartialRevert_1Call::abi_decode_raw(data, false).ok()?;
                 return self.maybe_decode(&e.revertData[..], status);
             }
             _ => {}
@@ -166,21 +218,27 @@ impl RevertDecoder {
         }
 
         // ABI-encoded `string`.
-        if let Ok(s) = String::abi_decode(err, false) {
+        if let Ok(s) = String::abi_decode(err, true) {
             return Some(s);
         }
 
-        // UTF-8-encoded string.
-        if let Ok(s) = std::str::from_utf8(err) {
-            return Some(s.to_string());
+        // ASCII string.
+        if err.is_ascii() {
+            return Some(std::str::from_utf8(err).unwrap().to_string());
         }
 
         // Generic custom error.
-        Some(format!(
-            "custom error {}:{}",
-            hex::encode(selector),
-            std::str::from_utf8(data).map_or_else(|_| trimmed_hex(data), String::from)
-        ))
+        Some({
+            let mut s = format!("custom error {}", hex::encode_prefixed(selector));
+            if !data.is_empty() {
+                s.push_str(": ");
+                match std::str::from_utf8(data) {
+                    Ok(data) => s.push_str(data),
+                    Err(_) => s.push_str(&trimmed_hex(data)),
+                }
+            }
+            s
+        })
     }
 }
 
@@ -193,7 +251,7 @@ fn trimmed_hex(s: &[u8]) -> String {
             "{}…{} ({} bytes)",
             &hex::encode(&s[..n / 2]),
             &hex::encode(&s[s.len() - n / 2..]),
-            s.len()
+            s.len(),
         )
     }
 }
